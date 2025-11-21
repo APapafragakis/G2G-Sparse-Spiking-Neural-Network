@@ -85,15 +85,22 @@ def run_cross_validation(
     fold_train_accs = []
     fold_val_accs = []
 
-    print(
+    base_msg = (
         f"\nRunning {k_folds}-fold CV | model={model_name}, "
-        f"p_inter={p_inter}, epochs={epochs}, batch_size={batch_size}"
+        f"epochs={epochs}, batch_size={batch_size}"
     )
 
+    if model_name in {"index", "random", "mixer"}:
+        base_msg = (
+            f"\nRunning {k_folds}-fold CV | model={model_name}, "
+            f"p_inter={p_inter}, epochs={epochs}, batch_size={batch_size}"
+        )
+
+    print(base_msg)
+
+
     for fold in range(k_folds):
-        print("\n" + "=" * 60)
         print(f"Fold {fold + 1}/{k_folds}")
-        print("=" * 60)
 
         # Determine validation indices for this fold
         val_start = fold * fold_size
