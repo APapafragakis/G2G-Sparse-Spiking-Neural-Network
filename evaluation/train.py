@@ -31,21 +31,26 @@ try:
 except ImportError:
     has_dml = False
 
-
 def select_device():
+    # If DirectML (for AMD GPUs)
     if has_dml:
         device = torch_directml.device()
-        print(f"Using device: {device}")
+        print(f"Using DirectML device: {device}")
         return device
 
+    # If NVIDIA GPU is available 
     if torch.cuda.is_available():
         device = torch.device("cuda")
-        print(f"Using device: {device}")
+        gpu_name = torch.cuda.get_device_name(0)
+        cuda_version = torch.version.cuda  
+        print(f"Using GPU: {gpu_name} | CUDA version: {cuda_version}")
         return device
     
+    # Fallback to CPU
     device = torch.device("cpu")
-    print("Warning: No GPU backend available, falling back to CPU.")
+    print("No GPU backend available — using CPU.")
     return device
+
 
 
 
