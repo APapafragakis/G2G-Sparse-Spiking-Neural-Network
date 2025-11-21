@@ -170,10 +170,8 @@ def run_cross_validation(
 
     print("\n" + "#" * 60)
     print("Cross-validation summary")
-    print("#" * 60)
     print(f"Train accuracy over folds: {train_mean:.2f}% ± {train_std:.2f}%")
     print(f"Val   accuracy over folds: {val_mean:.2f}% ± {val_std:.2f}%")
-    print("#" * 60)
 
     return {
         "fold_train_accs": fold_train_accs,
