@@ -67,11 +67,17 @@ global_step = 0
 # Number of training steps between DST updates
 UPDATE_INTERVAL = 1000
 
+# Modes for pruning (C_P) and growth (C_G)
+# cp_mode: "three" (SET+Random+Hebb), "set"
+# cg_mode: "hebb", "random"
+cp_mode = "three"
+cg_mode = "hebb"
+
 # Hebbian buffer:
 # for each sparse layer we store the latest batch of
 # pre- and post-synaptic activations
 hebb_buffer = {
-    "fc1": None,  # pre: input spikes, post: layer1 spikes
+    "fc1": None,  # pre: input spikes,  post: layer1 spikes
     "fc2": None,  # pre: layer1 spikes, post: layer2 spikes
     "fc3": None,  # pre: layer2 spikes, post: layer3 spikes
 }
@@ -125,7 +131,7 @@ def update_hebb_buffer(input_spikes: torch.Tensor, activations: dict):
     """
     global hebb_buffer
 
-    # Everything is kept on CPU to keep GPU memory usage lower
+    # Keep these on CPU to reduce pressure on GPU memory
     pre_fc1 = input_spikes.detach().cpu()         # [T, B, 784]
     post_fc1 = activations["layer1"].detach().cpu()
 
@@ -153,12 +159,12 @@ def compute_ch_matrix(pre_batch: torch.Tensor, post_batch: torch.Tensor) -> torc
     T_steps, B, N_in = pre_batch.shape
     _, _, N_out = post_batch.shape
 
-    # Flatten time and batch into one axis
+    # Flatten time and batch into a single axis
     pre_flat = pre_batch.reshape(T_steps * B, N_in)     # [TB, N_in]
     post_flat = post_batch.reshape(T_steps * B, N_out)  # [TB, N_out]
 
     # Each neuron gets a vector of length TB
-    pre_vecs = pre_flat.transpose(0, 1)    # [N_in, TB]
+    pre_vecs = pre_flat.transpose(0, 1)    # [N_in,  TB]
     post_vecs = post_flat.transpose(0, 1)  # [N_out, TB]
 
     eps = 1e-8
@@ -170,10 +176,54 @@ def compute_ch_matrix(pre_batch: torch.Tensor, post_batch: torch.Tensor) -> torc
     return ch
 
 
+def _grow_connections(
+    mask_cpu: torch.Tensor,
+    ch_cpu: torch.Tensor,
+    num_to_grow: int,
+    cg_mode_local: str,
+):
+    """
+    Helper for the growth step.
+
+    mask_cpu: 2D bool/binary mask on CPU
+    ch_cpu:   [out_features, in_features] cosine similarity matrix
+    num_to_grow: how many new edges to activate
+    cg_mode_local: "hebb" or "random"
+
+    Returns updated mask_cpu and the effective number of grown edges.
+    """
+    inactive_cpu = ~mask_cpu.bool()
+    num_inactive = inactive_cpu.sum().item()
+    if num_inactive == 0 or num_to_grow <= 0:
+        return mask_cpu, 0
+
+    num_to_grow = min(num_to_grow, num_inactive)
+    inactive_idx = inactive_cpu.nonzero(as_tuple=False)  # [N_inactive, 2]
+
+    if cg_mode_local == "hebb":
+        # Hebbian growth: pick edges with highest CH among inactive
+        inactive_scores = ch_cpu[inactive_cpu]  # 1D tensor
+        n_eff = min(num_to_grow, inactive_scores.numel())
+        if n_eff < 1:
+            return mask_cpu, 0
+        _, top_idx = torch.topk(inactive_scores, k=n_eff, largest=True)
+        grow_idx = inactive_idx[top_idx]
+
+    else:
+        # Random growth: sample uniformly among inactive positions
+        n_eff = num_to_grow
+        perm = torch.randperm(inactive_idx.size(0))[:n_eff]
+        grow_idx = inactive_idx[perm]
+
+    mask_cpu[grow_idx[:, 0], grow_idx[:, 1]] = 1
+    return mask_cpu, n_eff
+
+
 def dst_update_layer_three_prune_hebb_growth(
     layer: MixerSparseLinear,
     layer_name: str,
     prune_frac: float,
+    cg_mode_local: str,
 ):
     """
     DST update for a single MixerSparseLinear layer.
@@ -185,12 +235,11 @@ def dst_update_layer_three_prune_hebb_growth(
 
     Growth:
         C_G = C_H       (Hebbian growth: highest CH(i,j) among inactive edges)
-
-    Total number of dropped and grown connections is kept roughly the same.
+        or
+        C_G = Random    (random growth among inactive edges)
     """
     global hebb_buffer
 
-    # We need a stored batch of pre/post activations for this layer
     buf = hebb_buffer.get(layer_name, None)
     if buf is None or "pre" not in buf or "post" not in buf:
         # No activations yet -> skip this DST step
@@ -207,7 +256,7 @@ def dst_update_layer_three_prune_hebb_growth(
     ch_cpu = compute_ch_matrix(pre_batch, post_batch)  # [out_features, in_features]
 
     weight = layer.weight.data
-    mask = layer.mask  # on device
+    mask = layer.mask
 
     device = weight.device
 
@@ -220,35 +269,32 @@ def dst_update_layer_three_prune_hebb_growth(
     if num_active == 0:
         return
 
-    # Total target pruning based on current number of active connections
+    # Total pruning budget
     total_to_prune = int(prune_frac * num_active)
     if total_to_prune < 1:
         return
 
-    # Split pruning budget across the three criteria
-    # Here we take an equal share for each stage
+    # Split pruning budget across the three criteria (roughly equal)
     base = total_to_prune // 3
     n_set = base
     n_rand = base
-    n_hebb = total_to_prune - n_set - n_rand  # whatever remains
+    n_hebb = total_to_prune - n_set - n_rand
 
     total_pruned = 0
 
-    # --- 1) C_P = SET (magnitude-based pruning) ---
+    # ---- 1) C_P = SET (magnitude-based pruning) ----
     active_cpu = mask_cpu.bool()
     if n_set > 0 and active_cpu.sum().item() > 0:
         active_weights = w_cpu[active_cpu].abs()
-        # If we have fewer active edges than n_set, just prune all of them
         n_set_eff = min(n_set, active_weights.numel())
         if n_set_eff > 0:
             thresh, _ = torch.kthvalue(active_weights, n_set_eff)
             prune_mask_set = active_cpu & (w_cpu.abs() <= thresh)
-            # In case of ties we may prune slightly more; that is fine
             num_pruned_set = prune_mask_set.sum().item()
             mask_cpu[prune_mask_set] = 0
             total_pruned += num_pruned_set
 
-    # --- 2) C_P = Random (random pruning on active edges) ---
+    # ---- 2) C_P = Random ----
     active_cpu = mask_cpu.bool()
     if n_rand > 0 and active_cpu.sum().item() > 0:
         active_idx = active_cpu.nonzero(as_tuple=False)  # [N_active, 2]
@@ -259,50 +305,109 @@ def dst_update_layer_three_prune_hebb_growth(
             mask_cpu[rand_idx[:, 0], rand_idx[:, 1]] = 0
             total_pruned += n_rand_eff
 
-    # --- 3) C_P = C_H (Hebbian pruning: smallest CH among active edges) ---
+    # ---- 3) C_P = C_H (Hebbian pruning: smallest CH among active edges) ----
     active_cpu = mask_cpu.bool()
     if n_hebb > 0 and active_cpu.sum().item() > 0:
-        active_scores = ch_cpu[active_cpu]  # CH for currently active edges
+        active_scores = ch_cpu[active_cpu]
         n_hebb_eff = min(n_hebb, active_scores.numel())
         if n_hebb_eff > 0:
-            # Threshold for the lowest CH values
             thresh_hebb, _ = torch.kthvalue(active_scores, n_hebb_eff)
             prune_mask_hebb = active_cpu & (ch_cpu <= thresh_hebb)
             num_pruned_hebb = prune_mask_hebb.sum().item()
             mask_cpu[prune_mask_hebb] = 0
             total_pruned += num_pruned_hebb
 
-    # --- Growth: C_G = C_H (Hebbian growth on inactive edges) ---
-    active_cpu = mask_cpu.bool()
-    inactive_cpu = ~active_cpu
-    num_inactive = inactive_cpu.sum().item()
-    if num_inactive == 0 or total_pruned == 0:
-        # Sync mask back and clear inactive weights
+    # ---- Growth step ----
+    if total_pruned <= 0:
         mask.copy_(mask_cpu.to(device))
         weight[~mask.bool()] = 0.0
         return
 
-    num_grow = min(total_pruned, num_inactive)
-    inactive_idx = inactive_cpu.nonzero(as_tuple=False)  # [N_inactive, 2]
+    mask_cpu, grown = _grow_connections(
+        mask_cpu,
+        ch_cpu,
+        total_pruned,
+        cg_mode_local,
+    )
 
-    # Scores for inactive edges: CH(i,j)
-    inactive_scores = ch_cpu[inactive_cpu]  # 1D tensor
-    n_grow_eff = min(num_grow, inactive_scores.numel())
-    if n_grow_eff < 1:
-        mask.copy_(mask_cpu.to(device))
-        weight[~mask.bool()] = 0.0
-        return
-
-    # Take top-k CH for growth (largest CH)
-    _, top_idx = torch.topk(inactive_scores, k=n_grow_eff, largest=True)
-    grow_idx = inactive_idx[top_idx]  # [n_grow_eff, 2]
-
-    mask_cpu[grow_idx[:, 0], grow_idx[:, 1]] = 1
-
-    # Copy final mask back to the layer
+    # Copy mask back to device and clear inactive weights
     mask.copy_(mask_cpu.to(device))
+    weight[~mask.bool()] = 0.0
 
-    # Clear weights for all inactive connections
+
+def dst_update_layer_cp_set_cg(
+    layer: MixerSparseLinear,
+    layer_name: str,
+    prune_frac: float,
+    cg_mode_local: str,
+):
+    """
+    Simpler DST update for a single MixerSparseLinear layer.
+
+    Pruning:
+        C_P = SET (magnitude-based pruning on active edges)
+
+    Growth:
+        C_G = C_H    (Hebbian growth using CH), or
+        C_G = Random (uniform random growth)
+    """
+    global hebb_buffer
+
+    buf = hebb_buffer.get(layer_name, None)
+    if buf is None or "pre" not in buf or "post" not in buf:
+        return
+
+    pre_batch = buf["pre"]
+    post_batch = buf["post"]
+
+    if pre_batch.shape[-1] != layer.in_features or post_batch.shape[-1] != layer.out_features:
+        return
+
+    # For Hebbian growth we need CH
+    ch_cpu = compute_ch_matrix(pre_batch, post_batch)
+
+    weight = layer.weight.data
+    mask = layer.mask
+
+    device = weight.device
+
+    mask_cpu = mask.detach().cpu()
+    w_cpu = weight.detach().cpu()
+
+    active_cpu = mask_cpu.bool()
+    num_active = active_cpu.sum().item()
+    if num_active == 0:
+        return
+
+    total_to_prune = int(prune_frac * num_active)
+    if total_to_prune < 1:
+        return
+
+    # ---- C_P = SET (magnitude-based) ----
+    active_weights = w_cpu[active_cpu].abs()
+    n_eff = min(total_to_prune, active_weights.numel())
+    if n_eff > 0:
+        thresh, _ = torch.kthvalue(active_weights, n_eff)
+        prune_mask = active_cpu & (w_cpu.abs() <= thresh)
+        num_pruned = prune_mask.sum().item()
+        mask_cpu[prune_mask] = 0
+    else:
+        num_pruned = 0
+
+    # ---- Growth ----
+    if num_pruned <= 0:
+        mask.copy_(mask_cpu.to(device))
+        weight[~mask.bool()] = 0.0
+        return
+
+    mask_cpu, grown = _grow_connections(
+        mask_cpu,
+        ch_cpu,
+        num_pruned,
+        cg_mode_local,
+    )
+
+    mask.copy_(mask_cpu.to(device))
     weight[~mask.bool()] = 0.0
 
 
@@ -310,20 +415,44 @@ def dst_step(model: nn.Module, prune_frac: float = 0.025):
     """
     Apply one DST update step to all MixerSparseLinear layers in the model.
 
-    Current setting:
-        C_P = SET  -> Random -> C_H
-        C_G = C_H
+    Modes:
+        cp_mode = "three" -> C_P = SET -> Random -> C_H (paper-style)
+        cp_mode = "set"   -> C_P = SET only
+
+        cg_mode = "hebb"   -> C_G = C_H (Hebbian growth)
+        cg_mode = "random" -> C_G = Random
     """
     for name, module in model.named_modules():
-        if isinstance(module, MixerSparseLinear):
-            # name should end with 'fc1', 'fc2' or 'fc3' inside MixerSNN
-            short_name = name.split(".")[-1]
-            if short_name in hebb_buffer:
-                dst_update_layer_three_prune_hebb_growth(
-                    module,
-                    short_name,
-                    prune_frac,
-                )
+        if not isinstance(module, MixerSparseLinear):
+            continue
+
+        short_name = name.split(".")[-1]
+        if short_name not in hebb_buffer:
+            continue
+
+        if cp_mode == "three":
+            dst_update_layer_three_prune_hebb_growth(
+                module,
+                short_name,
+                prune_frac,
+                cg_mode,
+            )
+        elif cp_mode == "set":
+            dst_update_layer_cp_set_cg(
+                module,
+                short_name,
+                prune_frac,
+                cg_mode,
+            )
+        else:
+            # Fallback to the full three-pruning scheme
+            dst_update_layer_three_prune_hebb_growth(
+                module,
+                short_name,
+                prune_frac,
+                cg_mode,
+            )
+
     print("[DST] step executed")
 
 
@@ -491,6 +620,30 @@ def parse_args():
         ),
     )
 
+    parser.add_argument(
+        "--cp",
+        type=str,
+        default="three",
+        choices=["three", "set"],
+        help=(
+            "Pruning criterion C_P: "
+            "'three' = SET + Random + Hebbian (paper-style), "
+            "'set' = magnitude-based only."
+        ),
+    )
+
+    parser.add_argument(
+        "--cg",
+        type=str,
+        default="hebb",
+        choices=["hebb", "random"],
+        help=(
+            "Growth criterion C_G: "
+            "'hebb' = Hebbian (CH-based), "
+            "'random' = random growth on inactive edges."
+        ),
+    )
+
     return parser.parse_args()
 
 
@@ -498,8 +651,14 @@ def main():
     args = parse_args()
     device = select_device()
 
+    global cp_mode, cg_mode
+    cp_mode = args.cp
+    cg_mode = args.cg
+
     print(f"Selected model: {args.model}")
     print(f"Sparsity mode: {args.sparsity_mode}")
+    print(f"C_P (prune): {cp_mode}")
+    print(f"C_G (grow):  {cg_mode}")
 
     train_loader, test_loader = get_fashion_loaders(batch_size)
     model = build_model(args.model, p_inter=args.p_inter).to(device)
