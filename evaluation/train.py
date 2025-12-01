@@ -14,6 +14,7 @@ from models.dense_snn import DenseSNN
 from models.index_snn import IndexSNN
 from models.random_snn import RandomSNN
 from models.mixer_snn import MixerSNN
+from models.mixer_snn import MixerSparseLinear
 from data.data_fashionmnist import get_fashion_loaders
 from utils.encoding import rate_encode
 
@@ -102,7 +103,64 @@ def build_model(model_name: str, p_inter: float):
         raise ValueError(f"Unknown model type: {model_name}")
 
 
+def dst_update_layer_magnitude_random(layer, prune_frac: float):
+    
+    weight = layer.weight.data
+    mask = layer.mask  # buffer, same shape as weight
+
+    # Active / inactive connections
+    active = mask.bool()
+    inactive = ~active
+
+    num_active = active.sum().item()
+    if num_active == 0:
+        return
+
+    num_prune = int(prune_frac * num_active)
+    if num_prune < 1:
+        return
+
+    # Prune: smallest |w| among active
+    active_weights = weight[active].abs()
+    # find threshold for the num_prune smallest
+    thresh, _ = torch.kthvalue(active_weights, num_prune)
+    prune_mask = active & (weight.abs() <= thresh)
+
+    # Deactivate these connections
+    mask[prune_mask] = 0
+
+    # Grow: random growth among inactive
+    inactive = ~mask.bool()
+    num_inactive = inactive.sum().item()
+    num_grow = min(num_prune, num_inactive)
+    if num_grow < 1:
+        return
+
+    # Get indices of inactive connections
+    inactive_idx = inactive.nonzero(as_tuple=False)  # [N_inactive, 2]
+    perm = torch.randperm(num_inactive, device=weight.device)[:num_grow]
+    grow_idx = inactive_idx[perm]
+
+    # Activate these new connections
+    mask[grow_idx[:, 0], grow_idx[:, 1]] = 1
+
+    # Optional: clear inactive weights (cleanliness)
+    weight[~mask.bool()] = 0.0
+
+def dst_step(model, prune_frac=0.025):
+    """
+    Apply DST to ALL MixerSparseLinear layers of the model.
+    """
+    print("[DST] Performing dynamic sparse update...")
+    for module in model.modules():
+        if isinstance(module, MixerSparseLinear):
+            dst_update_layer_magnitude_random(module, prune_frac)
+
+global_step = 0
+UPDATE_INTERVAL = 1000 
+
 def train_one_epoch(model, loader, optimizer, device, epoch_idx: int):
+    global global_step
     model.train()
     total = 0
     correct = 0
@@ -120,6 +178,13 @@ def train_one_epoch(model, loader, optimizer, device, epoch_idx: int):
         loss = nn.CrossEntropyLoss()(spk_counts, labels)
         loss.backward()
         optimizer.step()
+
+        # Dynamic Sparse Training step for MixerSNN 
+        if isinstance(model, MixerSNN):
+            if global_step > 0 and global_step % UPDATE_INTERVAL == 0:
+                dst_step(model, prune_frac=0.025)
+
+        global_step += 1
 
         # Predictions based on spike counts
         preds = spk_counts.argmax(dim=1)
