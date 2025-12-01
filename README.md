@@ -153,7 +153,7 @@ G2GNet is inspired by ensemble connectivity in mouse visual cortex. The DST mech
 | Model | Sparse | Can use DST |
 |-------|--------|-------------|
 | Dense | ❌ | ❌ |
-| Index | ✔ | ⚠ static only |
+| Index | ✔ | static only |
 | Random | ✔ | ❌ |
 | Mixer | ✔ | ✔ **fully DST-ready** |
 
