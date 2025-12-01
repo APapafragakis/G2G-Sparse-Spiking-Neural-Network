@@ -2,7 +2,8 @@ import os
 import sys
 import argparse
 
-# Ensure project root is on sys.path so that "models", "data", etc. can be imported
+# Make sure the project root is on sys.path so that
+# "models", "data", etc. can be imported without issues.
 ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if ROOT_DIR not in sys.path:
     sys.path.append(ROOT_DIR)
@@ -50,12 +51,12 @@ def select_device():
     return device
 
 
-# Hyperparameters (shared across models)
+# Shared hyperparameters
 batch_size = 256
 T = 50
 input_dim = 28 * 28
 hidden_dim = 1024
-# Dense baseline with approximately the same number of parameters
+# Dense baseline with roughly the same number of parameters
 hidden_dim_dense = 447
 num_classes = 10
 num_epochs = 20
@@ -63,18 +64,21 @@ lr = 1e-3
 
 # Global state for Dynamic Sparse Training (DST)
 global_step = 0
-UPDATE_INTERVAL = 1000   # number of training steps between DST updates
+# Number of training steps between DST updates
+UPDATE_INTERVAL = 1000
 
-# Simple Hebbian-like stats: mean activity per neuron in each hidden layer
-hebb_stats = {
-    "layer1": None,
-    "layer2": None,
-    "layer3": None,
+# Hebbian buffer:
+# for each sparse layer we store the latest batch of
+# pre- and post-synaptic activations
+hebb_buffer = {
+    "fc1": None,  # pre: input spikes, post: layer1 spikes
+    "fc2": None,  # pre: layer1 spikes, post: layer2 spikes
+    "fc3": None,  # pre: layer2 spikes, post: layer3 spikes
 }
 
 
 def build_model(model_name: str, p_inter: float):
-    """Construct and return the selected model."""
+    """Build and return the selected model."""
     if model_name == "dense":
         return DenseSNN(input_dim, hidden_dim_dense, num_classes)
 
@@ -111,117 +115,226 @@ def build_model(model_name: str, p_inter: float):
     raise ValueError(f"Unknown model type: {model_name}")
 
 
-def update_hebb_stats(activations: dict):
+def update_hebb_buffer(input_spikes: torch.Tensor, activations: dict):
     """
-    Update global Hebbian stats using per-timestep activations.
+    Store the latest batch of pre/post activations for each MixerSparseLinear layer.
 
-    activations: dict with keys 'layer1', 'layer2', 'layer3'
-                 each tensor has shape [T, B, H] (spikes)
-    We store an exponential moving average of mean firing per neuron.
+    input_spikes: [T, B, input_dim]
+    activations:  dict with keys 'layer1', 'layer2', 'layer3',
+                  each tensor has shape [T, B, H]
     """
-    global hebb_stats
+    global hebb_buffer
 
-    for name in ["layer1", "layer2", "layer3"]:
-        if name not in activations:
-            continue
+    # Everything is kept on CPU to keep GPU memory usage lower
+    pre_fc1 = input_spikes.detach().cpu()         # [T, B, 784]
+    post_fc1 = activations["layer1"].detach().cpu()
 
-        acts = activations[name].float()  # [T, B, H]
-        # Mean over time and batch -> [H]
-        mean_activity = acts.mean(dim=(0, 1))  # [H]
+    pre_fc2 = activations["layer1"].detach().cpu()
+    post_fc2 = activations["layer2"].detach().cpu()
 
-        if hebb_stats[name] is None:
-            hebb_stats[name] = mean_activity
-        else:
-            # Exponential moving average for stability
-            hebb_stats[name] = 0.9 * hebb_stats[name] + 0.1 * mean_activity
+    pre_fc3 = activations["layer2"].detach().cpu()
+    post_fc3 = activations["layer3"].detach().cpu()
+
+    hebb_buffer["fc1"] = {"pre": pre_fc1, "post": post_fc1}
+    hebb_buffer["fc2"] = {"pre": pre_fc2, "post": post_fc2}
+    hebb_buffer["fc3"] = {"pre": pre_fc3, "post": post_fc3}
 
 
-def dst_update_layer_magnitude_random(layer: MixerSparseLinear, prune_frac: float):
+def compute_ch_matrix(pre_batch: torch.Tensor, post_batch: torch.Tensor) -> torch.Tensor:
+    """
+    Compute CH(i,j) = cosine similarity between pre and post neuron activation vectors.
+
+    pre_batch:  [T, B, N_in]
+    post_batch: [T, B, N_out]
+
+    Returns:
+        ch: [N_out, N_in] cosine similarity matrix
+    """
+    T_steps, B, N_in = pre_batch.shape
+    _, _, N_out = post_batch.shape
+
+    # Flatten time and batch into one axis
+    pre_flat = pre_batch.reshape(T_steps * B, N_in)     # [TB, N_in]
+    post_flat = post_batch.reshape(T_steps * B, N_out)  # [TB, N_out]
+
+    # Each neuron gets a vector of length TB
+    pre_vecs = pre_flat.transpose(0, 1)    # [N_in, TB]
+    post_vecs = post_flat.transpose(0, 1)  # [N_out, TB]
+
+    eps = 1e-8
+    pre_norm = pre_vecs / (pre_vecs.norm(dim=1, keepdim=True) + eps)
+    post_norm = post_vecs / (post_vecs.norm(dim=1, keepdim=True) + eps)
+
+    # Cosine similarity: post_norm @ pre_norm^T
+    ch = torch.matmul(post_norm, pre_norm.transpose(0, 1))  # [N_out, N_in]
+    return ch
+
+
+def dst_update_layer_three_prune_hebb_growth(
+    layer: MixerSparseLinear,
+    layer_name: str,
+    prune_frac: float,
+):
     """
     DST update for a single MixerSparseLinear layer.
 
-    - Prune: remove weights with the smallest absolute value |w|
-    - Grow: add the same number of new connections
-            biased towards more active output neurons
-            (simple Hebbian-like rule based on mean firing)
+    Pruning (three criteria in sequence):
+        1) C_P = SET    (magnitude-based pruning on active edges)
+        2) C_P = Random (random pruning on active edges)
+        3) C_P = C_H    (Hebbian pruning: lowest CH(i,j) are removed)
+
+    Growth:
+        C_G = C_H       (Hebbian growth: highest CH(i,j) among inactive edges)
+
+    Total number of dropped and grown connections is kept roughly the same.
     """
-    global hebb_stats
+    global hebb_buffer
+
+    # We need a stored batch of pre/post activations for this layer
+    buf = hebb_buffer.get(layer_name, None)
+    if buf is None or "pre" not in buf or "post" not in buf:
+        # No activations yet -> skip this DST step
+        return
+
+    pre_batch = buf["pre"]   # [T, B, N_in]
+    post_batch = buf["post"] # [T, B, N_out]
+
+    # Shapes must match this layer
+    if pre_batch.shape[-1] != layer.in_features or post_batch.shape[-1] != layer.out_features:
+        return
+
+    # Compute CH on CPU
+    ch_cpu = compute_ch_matrix(pre_batch, post_batch)  # [out_features, in_features]
 
     weight = layer.weight.data
-    mask = layer.mask  # current binary mask (0/1)
+    mask = layer.mask  # on device
 
-    # All positions are eligible (no static mask used here)
-    active = mask.bool()
-    inactive = ~active
+    device = weight.device
 
-    num_active = active.sum().item()
+    # Work on CPU for mask and CH; weights stay on device
+    mask_cpu = mask.detach().cpu()
+    w_cpu = weight.detach().cpu()
+
+    active_cpu = mask_cpu.bool()
+    num_active = active_cpu.sum().item()
     if num_active == 0:
         return
 
-    num_prune = int(prune_frac * num_active)
-    if num_prune < 1:
+    # Total target pruning based on current number of active connections
+    total_to_prune = int(prune_frac * num_active)
+    if total_to_prune < 1:
         return
 
-    # ---- PRUNE: smallest |w| among active positions ----
-    active_weights = weight[active].abs()
-    thresh, _ = torch.kthvalue(active_weights, num_prune)
-    prune_mask = active & (weight.abs() <= thresh)
-    mask[prune_mask] = 0
+    # Split pruning budget across the three criteria
+    # Here we take an equal share for each stage
+    base = total_to_prune // 3
+    n_set = base
+    n_rand = base
+    n_hebb = total_to_prune - n_set - n_rand  # whatever remains
 
-    # ---- GROW: select from inactive positions ----
-    inactive = ~mask.bool()
-    num_inactive = inactive.sum().item()
-    num_grow = min(num_prune, num_inactive)
-    if num_grow < 1:
+    total_pruned = 0
+
+    # --- 1) C_P = SET (magnitude-based pruning) ---
+    active_cpu = mask_cpu.bool()
+    if n_set > 0 and active_cpu.sum().item() > 0:
+        active_weights = w_cpu[active_cpu].abs()
+        # If we have fewer active edges than n_set, just prune all of them
+        n_set_eff = min(n_set, active_weights.numel())
+        if n_set_eff > 0:
+            thresh, _ = torch.kthvalue(active_weights, n_set_eff)
+            prune_mask_set = active_cpu & (w_cpu.abs() <= thresh)
+            # In case of ties we may prune slightly more; that is fine
+            num_pruned_set = prune_mask_set.sum().item()
+            mask_cpu[prune_mask_set] = 0
+            total_pruned += num_pruned_set
+
+    # --- 2) C_P = Random (random pruning on active edges) ---
+    active_cpu = mask_cpu.bool()
+    if n_rand > 0 and active_cpu.sum().item() > 0:
+        active_idx = active_cpu.nonzero(as_tuple=False)  # [N_active, 2]
+        n_rand_eff = min(n_rand, active_idx.size(0))
+        if n_rand_eff > 0:
+            perm = torch.randperm(active_idx.size(0))[:n_rand_eff]
+            rand_idx = active_idx[perm]
+            mask_cpu[rand_idx[:, 0], rand_idx[:, 1]] = 0
+            total_pruned += n_rand_eff
+
+    # --- 3) C_P = C_H (Hebbian pruning: smallest CH among active edges) ---
+    active_cpu = mask_cpu.bool()
+    if n_hebb > 0 and active_cpu.sum().item() > 0:
+        active_scores = ch_cpu[active_cpu]  # CH for currently active edges
+        n_hebb_eff = min(n_hebb, active_scores.numel())
+        if n_hebb_eff > 0:
+            # Threshold for the lowest CH values
+            thresh_hebb, _ = torch.kthvalue(active_scores, n_hebb_eff)
+            prune_mask_hebb = active_cpu & (ch_cpu <= thresh_hebb)
+            num_pruned_hebb = prune_mask_hebb.sum().item()
+            mask_cpu[prune_mask_hebb] = 0
+            total_pruned += num_pruned_hebb
+
+    # --- Growth: C_G = C_H (Hebbian growth on inactive edges) ---
+    active_cpu = mask_cpu.bool()
+    inactive_cpu = ~active_cpu
+    num_inactive = inactive_cpu.sum().item()
+    if num_inactive == 0 or total_pruned == 0:
+        # Sync mask back and clear inactive weights
+        mask.copy_(mask_cpu.to(device))
+        weight[~mask.bool()] = 0.0
         return
 
-    inactive_idx = inactive.nonzero(as_tuple=False)  # [N_inactive, 2]
-    out_indices = inactive_idx[:, 0]                 # output neuron indices
+    num_grow = min(total_pruned, num_inactive)
+    inactive_idx = inactive_cpu.nonzero(as_tuple=False)  # [N_inactive, 2]
 
-    # Try to find activity stats that match this layer's out_features
-    activity_vec = None
-    for key in ["layer1", "layer2", "layer3"]:
-        stats = hebb_stats.get(key, None)
-        if stats is not None and stats.numel() == layer.out_features:
-            # We found a vector with the right size
-            activity_vec = stats.to(weight.device)
-            break
+    # Scores for inactive edges: CH(i,j)
+    inactive_scores = ch_cpu[inactive_cpu]  # 1D tensor
+    n_grow_eff = min(num_grow, inactive_scores.numel())
+    if n_grow_eff < 1:
+        mask.copy_(mask_cpu.to(device))
+        weight[~mask.bool()] = 0.0
+        return
 
-    if activity_vec is None:
-        # Fallback: pure random growth if we do not have stats yet
-        perm = torch.randperm(num_inactive, device=weight.device)[:num_grow]
-        grow_idx = inactive_idx[perm]
-    else:
-        # Score per inactive edge based on the activity of the output neuron
-        out_scores = activity_vec[out_indices]  # [N_inactive]
-        out_scores = out_scores.clamp(min=1e-6)  # avoid zeros
-        probs = out_scores / out_scores.sum()
+    # Take top-k CH for growth (largest CH)
+    _, top_idx = torch.topk(inactive_scores, k=n_grow_eff, largest=True)
+    grow_idx = inactive_idx[top_idx]  # [n_grow_eff, 2]
 
-        # Sample edges without replacement according to these probabilities
-        chosen = torch.multinomial(probs, num_grow, replacement=False)
-        grow_idx = inactive_idx[chosen]
+    mask_cpu[grow_idx[:, 0], grow_idx[:, 1]] = 1
 
-    # Activate the chosen edges
-    mask[grow_idx[:, 0], grow_idx[:, 1]] = 1
+    # Copy final mask back to the layer
+    mask.copy_(mask_cpu.to(device))
 
-    # For clarity, set weights of inactive connections to zero
+    # Clear weights for all inactive connections
     weight[~mask.bool()] = 0.0
 
 
 def dst_step(model: nn.Module, prune_frac: float = 0.025):
     """
-    Apply a DST update to all MixerSparseLinear layers in the model.
+    Apply one DST update step to all MixerSparseLinear layers in the model.
+
+    Current setting:
+        C_P = SET  -> Random -> C_H
+        C_G = C_H
     """
-    for module in model.modules():
+    for name, module in model.named_modules():
         if isinstance(module, MixerSparseLinear):
-            dst_update_layer_magnitude_random(module, prune_frac)
+            # name should end with 'fc1', 'fc2' or 'fc3' inside MixerSNN
+            short_name = name.split(".")[-1]
+            if short_name in hebb_buffer:
+                dst_update_layer_three_prune_hebb_growth(
+                    module,
+                    short_name,
+                    prune_frac,
+                )
     print("[DST] step executed")
 
 
 def train_one_epoch(model, loader, optimizer, device, epoch_idx: int, use_dst: bool):
     """
-    Train the model for one epoch over the given DataLoader.
-    Optionally apply DST on MixerSNN layers if use_dst is True.
+    Train the model for one epoch on the given DataLoader.
+
+    In dynamic mode with MixerSNN:
+        - request activations from the model
+        - update Hebbian buffers
+        - apply DST every UPDATE_INTERVAL steps
     """
     global global_step
     model.train()
@@ -231,15 +344,15 @@ def train_one_epoch(model, loader, optimizer, device, epoch_idx: int, use_dst: b
     for batch_idx, (images, labels) in enumerate(loader):
         labels = labels.to(device, non_blocking=True)
 
-        # Rate encoding from images to spike trains
+        # Encode images into spike trains
         spikes = rate_encode(images, T).to(device)   # [T, B, 784]
 
         optimizer.zero_grad()
 
-        # For MixerSNN in dynamic mode, also return activations
         if use_dst and isinstance(model, MixerSNN):
+            # Ask the model to return per-layer activations for Hebbian updates
             spk_counts, activations = model(spikes, return_activations=True)
-            update_hebb_stats(activations)
+            update_hebb_buffer(spikes, activations)
         else:
             spk_counts = model(spikes)  # [B, num_classes]
 
@@ -247,7 +360,7 @@ def train_one_epoch(model, loader, optimizer, device, epoch_idx: int, use_dst: b
         loss.backward()
         optimizer.step()
 
-        # Dynamic Sparse Training step (only in dynamic mode and for MixerSNN)
+        # Dynamic Sparse Training step (MixerSNN only)
         if use_dst and isinstance(model, MixerSNN):
             if global_step > 0 and global_step % UPDATE_INTERVAL == 0:
                 dst_step(model, prune_frac=0.025)
@@ -264,7 +377,7 @@ def train_one_epoch(model, loader, optimizer, device, epoch_idx: int, use_dst: b
 
 @torch.no_grad()
 def evaluate(model, loader, device):
-    """Evaluate the model on a dataset and return accuracy."""
+    """Evaluate the model and return accuracy."""
     model.eval()
     total = 0
     correct = 0
@@ -285,7 +398,8 @@ def evaluate(model, loader, device):
 @torch.no_grad()
 def compute_firing_rates(model, loader, device):
     """
-    Compute mean firing rates per hidden layer and overall (hidden layers only).
+    Compute mean firing rates per hidden layer and overall
+    (only hidden layers are considered).
     """
     model.eval()
 
@@ -373,7 +487,7 @@ def parse_args():
         help=(
             "Sparsity mode for sparse models: "
             "'static' = only initial structured sparsity, "
-            "'dynamic' = apply Dynamic Sparse Training (DST) on non-static connections."
+            "'dynamic' = apply Dynamic Sparse Training (DST)."
         ),
     )
 
