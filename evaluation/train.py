@@ -63,7 +63,7 @@ lr = 1e-3
 
 # Global state for Dynamic Sparse Training (DST)
 global_step = 0
-UPDATE_INTERVAL = 100   # number of training steps between DST updates
+UPDATE_INTERVAL = 1000   # number of training steps between DST updates
 
 
 def build_model(model_name: str, p_inter: float):
