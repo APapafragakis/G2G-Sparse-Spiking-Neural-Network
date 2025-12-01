@@ -157,7 +157,7 @@ def dst_step(model, prune_frac=0.025):
             dst_update_layer_magnitude_random(module, prune_frac)
 
 global_step = 0
-UPDATE_INTERVAL = 1000 
+UPDATE_INTERVAL = 100 
 
 def train_one_epoch(model, loader, optimizer, device, epoch_idx: int):
     global global_step
