@@ -65,6 +65,13 @@ lr = 1e-3
 global_step = 0
 UPDATE_INTERVAL = 1000   # number of training steps between DST updates
 
+# Simple Hebbian-like stats: mean activity per neuron in each hidden layer
+hebb_stats = {
+    "layer1": None,
+    "layer2": None,
+    "layer3": None,
+}
+
 
 def build_model(model_name: str, p_inter: float):
     """Construct and return the selected model."""
@@ -104,29 +111,48 @@ def build_model(model_name: str, p_inter: float):
     raise ValueError(f"Unknown model type: {model_name}")
 
 
+def update_hebb_stats(activations: dict):
+    """
+    Update global Hebbian stats using per-timestep activations.
+
+    activations: dict with keys 'layer1', 'layer2', 'layer3'
+                 each tensor has shape [T, B, H] (spikes)
+    We store an exponential moving average of mean firing per neuron.
+    """
+    global hebb_stats
+
+    for name in ["layer1", "layer2", "layer3"]:
+        if name not in activations:
+            continue
+
+        acts = activations[name].float()  # [T, B, H]
+        # Mean over time and batch -> [H]
+        mean_activity = acts.mean(dim=(0, 1))  # [H]
+
+        if hebb_stats[name] is None:
+            hebb_stats[name] = mean_activity
+        else:
+            # Exponential moving average for stability
+            hebb_stats[name] = 0.9 * hebb_stats[name] + 0.1 * mean_activity
+
+
 def dst_update_layer_magnitude_random(layer: MixerSparseLinear, prune_frac: float):
     """
-    Apply a DST update to a single MixerSparseLinear layer.
+    DST update for a single MixerSparseLinear layer.
 
     - Prune: remove weights with the smallest absolute value |w|
-    - Grow: add the same number of new connections at random
-    - Respect layer.mask_static: static connections are never modified
+    - Grow: add the same number of new connections
+            biased towards more active output neurons
+            (simple Hebbian-like rule based on mean firing)
     """
+    global hebb_stats
+
     weight = layer.weight.data
     mask = layer.mask  # current binary mask (0/1)
 
-    # Use static_mask if available; those connections are protected
-    static_mask = getattr(layer, "mask_static", None)
-    if static_mask is not None:
-        static_mask = static_mask.bool()
-        non_static = ~static_mask
-    else:
-        # If no static mask exists, treat all positions as non-static
-        non_static = torch.ones_like(mask, dtype=torch.bool)
-
-    # Only non-static positions are eligible for DST
-    active = mask.bool() & non_static
-    inactive = (~mask.bool()) & non_static
+    # All positions are eligible (no static mask used here)
+    active = mask.bool()
+    inactive = ~active
 
     num_active = active.sum().item()
     if num_active == 0:
@@ -136,25 +162,49 @@ def dst_update_layer_magnitude_random(layer: MixerSparseLinear, prune_frac: floa
     if num_prune < 1:
         return
 
-    # Prune: smallest |w| among active & non-static positions
+    # ---- PRUNE: smallest |w| among active positions ----
     active_weights = weight[active].abs()
     thresh, _ = torch.kthvalue(active_weights, num_prune)
     prune_mask = active & (weight.abs() <= thresh)
     mask[prune_mask] = 0
 
-    # Grow: random new connections in inactive & non-static positions
-    inactive = (~mask.bool()) & non_static
+    # ---- GROW: select from inactive positions ----
+    inactive = ~mask.bool()
     num_inactive = inactive.sum().item()
     num_grow = min(num_prune, num_inactive)
     if num_grow < 1:
         return
 
     inactive_idx = inactive.nonzero(as_tuple=False)  # [N_inactive, 2]
-    perm = torch.randperm(num_inactive, device=weight.device)[:num_grow]
-    grow_idx = inactive_idx[perm]
+    out_indices = inactive_idx[:, 0]                 # output neuron indices
+
+    # Try to find activity stats that match this layer's out_features
+    activity_vec = None
+    for key in ["layer1", "layer2", "layer3"]:
+        stats = hebb_stats.get(key, None)
+        if stats is not None and stats.numel() == layer.out_features:
+            # We found a vector with the right size
+            activity_vec = stats.to(weight.device)
+            break
+
+    if activity_vec is None:
+        # Fallback: pure random growth if we do not have stats yet
+        perm = torch.randperm(num_inactive, device=weight.device)[:num_grow]
+        grow_idx = inactive_idx[perm]
+    else:
+        # Score per inactive edge based on the activity of the output neuron
+        out_scores = activity_vec[out_indices]  # [N_inactive]
+        out_scores = out_scores.clamp(min=1e-6)  # avoid zeros
+        probs = out_scores / out_scores.sum()
+
+        # Sample edges without replacement according to these probabilities
+        chosen = torch.multinomial(probs, num_grow, replacement=False)
+        grow_idx = inactive_idx[chosen]
+
+    # Activate the chosen edges
     mask[grow_idx[:, 0], grow_idx[:, 1]] = 1
 
-    # Clear weights of inactive connections for numerical cleanliness
+    # For clarity, set weights of inactive connections to zero
     weight[~mask.bool()] = 0.0
 
 
@@ -185,7 +235,14 @@ def train_one_epoch(model, loader, optimizer, device, epoch_idx: int, use_dst: b
         spikes = rate_encode(images, T).to(device)   # [T, B, 784]
 
         optimizer.zero_grad()
-        spk_counts = model(spikes)                  # [B, num_classes]
+
+        # For MixerSNN in dynamic mode, also return activations
+        if use_dst and isinstance(model, MixerSNN):
+            spk_counts, activations = model(spikes, return_activations=True)
+            update_hebb_stats(activations)
+        else:
+            spk_counts = model(spikes)  # [B, num_classes]
+
         loss = nn.CrossEntropyLoss()(spk_counts, labels)
         loss.backward()
         optimizer.step()
@@ -302,8 +359,10 @@ def parse_args():
         "--p_inter",
         type=float,
         default=0.15,
-        help="Inter-group connection probability p' for sparse models "
-             "(Index, Random, Mixer). Ignored for the dense model.",
+        help=(
+            "Inter-group connection probability p' for sparse models "
+            "(Index, Random, Mixer). Ignored for the dense model."
+        ),
     )
 
     parser.add_argument(
@@ -311,9 +370,11 @@ def parse_args():
         type=str,
         default="static",
         choices=["static", "dynamic"],
-        help="Sparsity mode for sparse models: "
-             "'static' = only initial structured sparsity, "
-             "'dynamic' = apply Dynamic Sparse Training (DST) on non-static connections.",
+        help=(
+            "Sparsity mode for sparse models: "
+            "'static' = only initial structured sparsity, "
+            "'dynamic' = apply Dynamic Sparse Training (DST) on non-static connections."
+        ),
     )
 
     return parser.parse_args()
