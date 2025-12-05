@@ -21,7 +21,7 @@ from models.dense_snn import DenseSNN
 from models.mixer_snn import MixerSNN, MixerSparseLinear
 from models.er_snn import ERSNN, ERSparseLinear
 from models.cnn_encoder import PatchConvEncoder
-from data.data_fashionmnist import get_fashion_loaders
+from data.fashionmnist import get_fashion_loaders
 
 warnings.filterwarnings(
     "ignore",

@@ -14,7 +14,7 @@ from models.dense_snn import DenseSNN
 from models.index_snn import IndexSNN
 from models.random_snn import RandomSNN
 from models.mixer_snn import MixerSNN, MixerSparseLinear
-from data.data_fashionmnist import get_fashion_loaders
+from data.fashionmnist import get_fashion_loaders
 from utils.encoding import rate_encode
 
 import warnings
