@@ -62,7 +62,7 @@ feature_dim = 512        # Output dimension of PatchConvEncoder
 hidden_dim = 1024        # Width of the main SNN head (matches G2GNet paper)
 hidden_dim_dense = 469   # Narrow FC baseline with similar param budget
 num_classes = 10
-num_epochs = 50
+num_epochs = 40
 lr = 1e-3
 weight_decay = 1e-5
 
