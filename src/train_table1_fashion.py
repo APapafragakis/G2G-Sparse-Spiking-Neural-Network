@@ -88,19 +88,12 @@ class CNNSNNWrapper(nn.Module):
         self.T = T_steps
 
     def encode_to_sequence(self, images: torch.Tensor) -> torch.Tensor:
-        """
-        Encode images to a feature vector and tile it along the time dimension.
-        """
-        # images: [B, 1, 28, 28]
         feats = self.encoder(images)  # [B, 512]
 
         with torch.no_grad():
-            f_min = feats.min(dim=1, keepdim=True)[0]
-            f_max = feats.max(dim=1, keepdim=True)[0]
-            denom = (f_max - f_min).clamp(min=1e-6)
-            feats_norm = (feats - f_min) / denom
+            feats_norm = torch.clamp(feats / feats.abs().max(), -1, 1)
 
-        x_seq = feats_norm.unsqueeze(0).repeat(self.T, 1, 1)  # [T, B, 512]
+        x_seq = feats_norm.unsqueeze(0).repeat(self.T, 1, 1)
         return x_seq
 
     def forward(self, images: torch.Tensor, return_hidden_spikes: bool = False):
