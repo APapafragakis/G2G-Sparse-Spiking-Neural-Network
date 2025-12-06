@@ -63,8 +63,8 @@ hidden_dim = 1024        # Width of the main SNN head (matches G2GNet paper)
 hidden_dim_dense = 469   # Narrow FC baseline with similar param budget
 num_classes = 10
 num_epochs = 30
-lr = 5e-4
-weight_decay = 5e-4
+lr = 1e-3
+weight_decay = 1e-4
 
 num_groups = 8
 p_intra = 1.0
