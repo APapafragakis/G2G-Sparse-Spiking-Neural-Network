@@ -20,14 +20,13 @@ class PatchConvEncoder(nn.Module):
         self.pool3 = nn.AdaptiveAvgPool2d((4, 4))
         
         self.activation = nn.ReLU(inplace=True)
-        self.dropout = nn.Dropout2d(0.2)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self.activation(self.bn1(self.conv1(x)))
-        x = self.dropout(self.pool1(x))
+        x = self.pool1(x)
         
         x = self.activation(self.bn2(self.conv2(x)))
-        x = self.dropout(self.pool2(x))
+        x = self.pool2(x)
         
         x = self.activation(self.bn3(self.conv3(x)))
         x = self.pool3(x)
