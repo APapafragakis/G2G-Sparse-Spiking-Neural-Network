@@ -68,7 +68,7 @@ weight_decay = 1e-4
 
 num_groups = 8
 p_intra = 1.0
-p_inter = 0.10
+p_inter = 0.15
 p_er_active = 0.25625    # ER sparsity chosen to match G2G param budget
 
 
