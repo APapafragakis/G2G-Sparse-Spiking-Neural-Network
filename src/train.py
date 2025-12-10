@@ -354,52 +354,58 @@ def compute_group_synchrony(model, loader, device, num_groups: int):
 
 
 @torch.no_grad()
-def compute_input_spike_dispersion(model, loader, device):
+def compute_per_neuron_correlation(model, loader, device):
     """
-    Measures temporal dispersion of incoming spikes for each neuron.
-    Higher dispersion means inputs arrive asynchronously, making it harder
-    for neurons to accumulate charge and reach threshold due to membrane leakage.
-    
-    This directly tests the hypothesis: higher p_inter -> more cross-group connections
-    -> inputs from neurons processing different features -> asynchronous spike arrival
-    -> lower effective input integration -> reduced firing rates.
+    Analyzes per-neuron relationship between cross-group connectivity,
+    input spike timing dispersion, and firing rates.
+    Tests hypothesis: neurons with more cross-group connections receive
+    more asynchronous inputs, leading to lower firing rates.
     """
     if not isinstance(model, IndexSNN):
-        raise TypeError("compute_input_spike_dispersion requires IndexSNN")
+        raise TypeError("Requires IndexSNN architecture")
     
     model.eval()
     
-    layer_configs = [
-        ("layer2", model.fc2, "layer1"),
-        ("layer3", model.fc3, "layer2"),
-    ]
-    
-    results = {}
+    layer_data = {}
     
     for images, _ in loader:
         B = images.size(0)
         spikes_input = rate_encode(images, T).to(device)
         _, hidden_time = model(spikes_input, return_time_series=True)
         
-        for target_name, fc_layer, source_name in layer_configs:
+        for layer_name, fc_layer, source_name in [
+            ("layer2", model.fc2, "layer1"),
+            ("layer3", model.fc3, "layer2")
+        ]:
             mask = fc_layer.mask
             source_spikes = hidden_time[source_name]
+            target_spikes = hidden_time[layer_name]
+            
             T_steps, _, N_in = source_spikes.shape
             N_out = mask.size(0)
             
-            t_indices = torch.arange(T_steps, device=device, dtype=torch.float32)
+            group_size_in = N_in // model.fc1.num_groups
+            group_size_out = N_out // model.fc1.num_groups
             
+            cross_group_ratios = []
             dispersions = []
+            firing_rates = []
             
             for neuron_idx in range(N_out):
                 conn_mask = mask[neuron_idx].bool()
-                num_connected = conn_mask.sum().item()
+                num_conn = conn_mask.sum().item()
                 
-                if num_connected == 0:
+                if num_conn == 0:
                     continue
                 
-                incoming = source_spikes[:, :, conn_mask]
+                neuron_group = neuron_idx // group_size_out
                 
+                connected_indices = torch.where(conn_mask)[0]
+                connected_groups = connected_indices // group_size_in
+                cross_group = (connected_groups != neuron_group).sum().item()
+                cross_ratio = cross_group / num_conn
+                
+                incoming = source_spikes[:, :, conn_mask]
                 spike_times = []
                 for t in range(T_steps):
                     if incoming[t].sum() > 0:
@@ -408,24 +414,36 @@ def compute_input_spike_dispersion(model, loader, device):
                 if len(spike_times) < 2:
                     continue
                 
-                spike_times_tensor = torch.tensor(spike_times, dtype=torch.float32, device=device)
-                std_val = spike_times_tensor.std().item()
-                dispersions.append(std_val)
+                spike_times_tensor = torch.tensor(spike_times, dtype=torch.float32)
+                dispersion = spike_times_tensor.std().item()
+                
+                neuron_fr = target_spikes[:, :, neuron_idx].sum().item() / (T_steps * B)
+                
+                cross_group_ratios.append(cross_ratio)
+                dispersions.append(dispersion)
+                firing_rates.append(neuron_fr)
             
-            if dispersions:
-                key = f"{target_name}_input_dispersion"
-                mean_disp = sum(dispersions) / len(dispersions)
-                if key not in results:
-                    results[key] = []
-                results[key].append(mean_disp)
+            if len(cross_group_ratios) > 10:
+                import numpy as np
+                
+                cgr = np.array(cross_group_ratios)
+                disp = np.array(dispersions)
+                fr = np.array(firing_rates)
+                
+                corr_cg_disp = np.corrcoef(cgr, disp)[0, 1]
+                corr_disp_fr = np.corrcoef(disp, fr)[0, 1]
+                
+                layer_data[layer_name] = {
+                    "cross_group_ratio_mean": cgr.mean(),
+                    "dispersion_mean": disp.mean(),
+                    "firing_rate_mean": fr.mean(),
+                    "corr_crossgroup_dispersion": corr_cg_disp,
+                    "corr_dispersion_firingrate": corr_disp_fr,
+                }
         
         break
     
-    final_results = {}
-    for key, vals in results.items():
-        final_results[key] = sum(vals) / len(vals) if vals else 0.0
-    
-    return final_results
+    return layer_data
 
 
 def parse_args():
@@ -492,11 +510,21 @@ def main():
         print(f"  Layer 3 mean temporal var: {sync['layer3_mean_temporal_var']:.6f}")
         print("  (Lower variance => more synchronized spikes within groups)")
         
-        disp = compute_input_spike_dispersion(model, test_loader, device)
-        print("\nInput spike temporal dispersion (std of spike arrival times):")
-        print(f"  Layer 2 input dispersion: {disp.get('layer2_input_dispersion', 0.0):.6f}")
-        print(f"  Layer 3 input dispersion: {disp.get('layer3_input_dispersion', 0.0):.6f}")
-        print("  (Higher dispersion => more asynchronous inputs => harder to reach threshold)")
+        corr_data = compute_per_neuron_correlation(model, test_loader, device)
+        if corr_data:
+            print("\nPer-neuron correlation analysis:")
+            for layer_name in ["layer2", "layer3"]:
+                if layer_name in corr_data:
+                    d = corr_data[layer_name]
+                    print(f"\n  {layer_name.capitalize()}:")
+                    print(f"    Avg cross-group ratio: {d['cross_group_ratio_mean']:.4f}")
+                    print(f"    Avg input dispersion: {d['dispersion_mean']:.4f}")
+                    print(f"    Avg firing rate: {d['firing_rate_mean']:.6f}")
+                    print(f"    Correlation (cross-group % vs dispersion): r={d['corr_crossgroup_dispersion']:.3f}")
+                    print(f"    Correlation (dispersion vs firing rate): r={d['corr_dispersion_firingrate']:.3f}")
+            print("\n  Interpretation:")
+            print("    Positive r (cross-group vs dispersion): more cross-group -> more async inputs")
+            print("    Negative r (dispersion vs firing): more async inputs -> lower firing rates")
 
 
 if __name__ == "__main__":
