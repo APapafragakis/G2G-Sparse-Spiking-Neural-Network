@@ -149,7 +149,12 @@ class IndexSNN(nn.Module):
         self.lif3 = snn.Leaky(beta=beta, spike_grad=spike_grad)
         self.lif_out = snn.Leaky(beta=beta, spike_grad=spike_grad)
 
-    def forward(self, x_seq, return_hidden_spikes: bool = False):
+    def forward(
+        self,
+        x_seq,
+        return_hidden_spikes: bool = False,
+        return_time_series: bool = False,
+    ):
         # x_seq: [T, B, input_dim]
         T_steps, B, _ = x_seq.shape
 
@@ -162,11 +167,17 @@ class IndexSNN(nn.Module):
         # Accumulate spikes over time (rate coding at the output)
         spk_out_sum = torch.zeros(B, self.fc_out.out_features, device=x_seq.device)
 
-        # Optionally accumulate spikes for hidden layers
+        # Sum of hidden spikes
         if return_hidden_spikes:
             spk1_sum = torch.zeros(B, self.fc1.out_features, device=x_seq.device)
             spk2_sum = torch.zeros(B, self.fc2.out_features, device=x_seq.device)
             spk3_sum = torch.zeros(B, self.fc3.out_features, device=x_seq.device)
+
+        # Full time-series of hidden spikes
+        if return_time_series:
+            spk1_time = []
+            spk2_time = []
+            spk3_time = []
 
         for t in range(T_steps):
             x_t = x_seq[t]  # [B, input_dim] at time step t
@@ -187,15 +198,38 @@ class IndexSNN(nn.Module):
             cur_out = self.fc_out(spk3)
             spk_out, mem_out = self.lif_out(cur_out, mem_out)
 
-            # Sum spikes across time steps
+            # Sum spikes across time steps (output)
             spk_out_sum += spk_out
 
+            # Sum spikes (hidden)
             if return_hidden_spikes:
                 spk1_sum += spk1
                 spk2_sum += spk2
                 spk3_sum += spk3
 
-        # Shape: [B, num_classes] (spike counts per class)
+            # Store time series
+            if return_time_series:
+                spk1_time.append(spk1)
+                spk2_time.append(spk2)
+                spk3_time.append(spk3)
+
+        # Prepare outputs
+        if return_time_series:
+            hidden_time = {
+                "layer1": torch.stack(spk1_time, dim=0),  # [T, B, H]
+                "layer2": torch.stack(spk2_time, dim=0),
+                "layer3": torch.stack(spk3_time, dim=0),
+            }
+            if return_hidden_spikes:
+                hidden_spikes = {
+                    "layer1": spk1_sum,  # [B, H]
+                    "layer2": spk2_sum,
+                    "layer3": spk3_sum,
+                }
+                return spk_out_sum, hidden_spikes, hidden_time
+            else:
+                return spk_out_sum, hidden_time
+
         if return_hidden_spikes:
             hidden_spikes = {
                 "layer1": spk1_sum,  # [B, hidden_dim]
