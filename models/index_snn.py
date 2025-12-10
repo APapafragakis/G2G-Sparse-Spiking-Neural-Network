@@ -149,93 +149,84 @@ class IndexSNN(nn.Module):
         self.lif3 = snn.Leaky(beta=beta, spike_grad=spike_grad)
         self.lif_out = snn.Leaky(beta=beta, spike_grad=spike_grad)
 
-    def forward(
-        self,
-        x_seq,
-        return_hidden_spikes: bool = False,
-        return_time_series: bool = False,
-    ):
-        # x_seq: [T, B, input_dim]
-        T_steps, B, _ = x_seq.shape
+        def forward(
+            self,
+            x_seq,
+            return_hidden_spikes: bool = False,
+            return_time_series: bool = False,
+        ):
+            # x_seq: [T, B, input_dim]
+            T_steps, B, _ = x_seq.shape
+            device = x_seq.device
 
-        # Initialise membrane potentials for all layers
-        mem1 = torch.zeros(B, self.fc1.out_features, device=x_seq.device)
-        mem2 = torch.zeros(B, self.fc2.out_features, device=x_seq.device)
-        mem3 = torch.zeros(B, self.fc3.out_features, device=x_seq.device)
-        mem_out = torch.zeros(B, self.fc_out.out_features, device=x_seq.device)
+            # Membrane potentials
+            mem1 = torch.zeros(B, self.fc1.out_features, device=device)
+            mem2 = torch.zeros(B, self.fc2.out_features, device=device)
+            mem3 = torch.zeros(B, self.fc3.out_features, device=device)
+            mem_out = torch.zeros(B, self.fc_out.out_features, device=device)
 
-        # Accumulate spikes over time (rate coding at the output)
-        spk_out_sum = torch.zeros(B, self.fc_out.out_features, device=x_seq.device)
+            # Output spike counts
+            spk_out_sum = torch.zeros(B, self.fc_out.out_features, device=device)
 
-        # Sum of hidden spikes
-        if return_hidden_spikes:
-            spk1_sum = torch.zeros(B, self.fc1.out_features, device=x_seq.device)
-            spk2_sum = torch.zeros(B, self.fc2.out_features, device=x_seq.device)
-            spk3_sum = torch.zeros(B, self.fc3.out_features, device=x_seq.device)
-
-        # Full time-series of hidden spikes
-        if return_time_series:
-            spk1_time = []
-            spk2_time = []
-            spk3_time = []
-
-        for t in range(T_steps):
-            x_t = x_seq[t]  # [B, input_dim] at time step t
-
-            # Layer 1
-            cur1 = self.fc1(x_t)
-            spk1, mem1 = self.lif1(cur1, mem1)
-
-            # Layer 2
-            cur2 = self.fc2(spk1)
-            spk2, mem2 = self.lif2(cur2, mem2)
-
-            # Layer 3
-            cur3 = self.fc3(spk2)
-            spk3, mem3 = self.lif3(cur3, mem3)
-
-            # Output layer
-            cur_out = self.fc_out(spk3)
-            spk_out, mem_out = self.lif_out(cur_out, mem_out)
-
-            # Sum spikes across time steps (output)
-            spk_out_sum += spk_out
-
-            # Sum spikes (hidden)
+            # Optional: sums of hidden spikes over time
             if return_hidden_spikes:
-                spk1_sum += spk1
-                spk2_sum += spk2
-                spk3_sum += spk3
+                spk1_sum = torch.zeros(B, self.fc1.out_features, device=device)
+                spk2_sum = torch.zeros(B, self.fc2.out_features, device=device)
+                spk3_sum = torch.zeros(B, self.fc3.out_features, device=device)
 
-            # Store time series
+            # Optional: full time series of hidden spikes [T, B, H]
             if return_time_series:
-                spk1_time.append(spk1)
-                spk2_time.append(spk2)
-                spk3_time.append(spk3)
+                spk1_ts = torch.zeros(T_steps, B, self.fc1.out_features, device=device)
+                spk2_ts = torch.zeros(T_steps, B, self.fc2.out_features, device=device)
+                spk3_ts = torch.zeros(T_steps, B, self.fc3.out_features, device=device)
 
-        # Prepare outputs
-        if return_time_series:
-            hidden_time = {
-                "layer1": torch.stack(spk1_time, dim=0),  # [T, B, H]
-                "layer2": torch.stack(spk2_time, dim=0),
-                "layer3": torch.stack(spk3_time, dim=0),
-            }
+            for t in range(T_steps):
+                x_t = x_seq[t]  # [B, input_dim]
+
+                # Layer 1
+                cur1 = self.fc1(x_t)
+                spk1, mem1 = self.lif1(cur1, mem1)
+
+                # Layer 2
+                cur2 = self.fc2(spk1)
+                spk2, mem2 = self.lif2(cur2, mem2)
+
+                # Layer 3
+                cur3 = self.fc3(spk2)
+                spk3, mem3 = self.lif3(cur3, mem3)
+
+                # Output
+                cur_out = self.fc_out(spk3)
+                spk_out, mem_out = self.lif_out(cur_out, mem_out)
+
+                spk_out_sum += spk_out
+
+                if return_hidden_spikes:
+                    spk1_sum += spk1
+                    spk2_sum += spk2
+                    spk3_sum += spk3
+
+                if return_time_series:
+                    spk1_ts[t] = spk1
+                    spk2_ts[t] = spk2
+                    spk3_ts[t] = spk3
+
+            # 1) time-series mode
+            if return_time_series:
+                hidden_time = {
+                    "layer1": spk1_ts,  # [T, B, H]
+                    "layer2": spk2_ts,
+                    "layer3": spk3_ts,
+                }
+                return spk_out_sum, hidden_time
+
+            # 2) summed-hidden mode 
             if return_hidden_spikes:
                 hidden_spikes = {
                     "layer1": spk1_sum,  # [B, H]
                     "layer2": spk2_sum,
                     "layer3": spk3_sum,
                 }
-                return spk_out_sum, hidden_spikes, hidden_time
-            else:
-                return spk_out_sum, hidden_time
+                return spk_out_sum, hidden_spikes
 
-        if return_hidden_spikes:
-            hidden_spikes = {
-                "layer1": spk1_sum,  # [B, hidden_dim]
-                "layer2": spk2_sum,
-                "layer3": spk3_sum,
-            }
-            return spk_out_sum, hidden_spikes
-
-        return spk_out_sum
+            return spk_out_sum
