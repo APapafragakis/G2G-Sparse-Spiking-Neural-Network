@@ -5,7 +5,7 @@ import torch.nn.functional as F
 import snntorch as snn
 from snntorch import surrogate
 
-# Define a custom linear layer with index-based sparse connectivity
+
 class IndexSparseLinear(nn.Module):
     def __init__(
         self,
@@ -18,7 +18,6 @@ class IndexSparseLinear(nn.Module):
     ):
         super().__init__()
 
-        # Check that feature dimensions can be evenly split into groups
         if in_features % num_groups != 0 or out_features % num_groups != 0:
             raise ValueError(
                 f"in_features ({in_features}) and out_features ({out_features}) "
@@ -31,60 +30,47 @@ class IndexSparseLinear(nn.Module):
         self.p_intra = float(p_intra)
         self.p_inter = float(p_inter)
 
-        # Full weight matrix; sparsity is enforced by a fixed binary mask
         self.weight = nn.Parameter(torch.empty(out_features, in_features))
         if bias:
             self.bias = nn.Parameter(torch.empty(out_features))
         else:
             self.bias = None
 
-        # Build the fixed binary connectivity mask
         mask = self._build_mask()
-        # Register as buffer so it moves with .to(device) but is not trainable
         self.register_buffer("mask", mask)
 
         self.reset_parameters()
 
     def _build_mask(self) -> torch.Tensor:
-        """Construct the binary connectivity mask based on index-based groups."""
         in_group_size = self.in_features // self.num_groups
         out_group_size = self.out_features // self.num_groups
 
-        in_idx = torch.arange(self.in_features)    # [in_features]
-        out_idx = torch.arange(self.out_features)  # [out_features]
+        in_idx = torch.arange(self.in_features)
+        out_idx = torch.arange(self.out_features)
 
-        # Group assignment based on integer division of the index
-        in_group = in_idx // in_group_size         # [in_features]
-        out_group = out_idx // out_group_size      # [out_features]
+        in_group = in_idx // in_group_size
+        out_group = out_idx // out_group_size
 
-        # same_group[o, i] is True if input i and output o belong to the same group
-        same_group = (out_group[:, None] == in_group[None, :])  # [out_features, in_features]
+        same_group = (out_group[:, None] == in_group[None, :])
 
-        # Start with inter-group probability everywhere
         probs = torch.full((self.out_features, self.in_features), self.p_inter)
-        # Overwrite same-group entries with the intra-group probability
         probs[same_group] = self.p_intra
 
-        # Sample a binary mask according to the defined probabilities
         mask = torch.bernoulli(probs)
         return mask
 
     def reset_parameters(self) -> None:
-        """Initialize weights and biases taking sparsity into account."""
-        # Standard Kaiming init as if the layer were dense
         nn.init.kaiming_uniform_(self.weight, a=5**0.5)
 
-        # Rescale active weights row-wise based on actual fan-in
         with torch.no_grad():
             full_fan_in = float(self.in_features)
             for out_idx in range(self.out_features):
-                row_mask = self.mask[out_idx]  # [in_features]
+                row_mask = self.mask[out_idx]
                 fan_in_active = row_mask.sum().item()
                 if fan_in_active > 0 and fan_in_active < full_fan_in:
                     scale = (full_fan_in / fan_in_active) ** 0.5
                     self.weight[out_idx, row_mask.bool()] *= scale
 
-        # Bias init based on effective fan-in
         if self.bias is not None:
             fan_in_eff = self.mask.sum(dim=1).float().mean().item()
             if fan_in_eff <= 0:
@@ -92,13 +78,7 @@ class IndexSparseLinear(nn.Module):
             bound = 1.0 / fan_in_eff**0.5
             nn.init.uniform_(self.bias, -bound, bound)
 
-
     def forward(self, input: torch.Tensor) -> torch.Tensor:
-        """
-        input: [batch_size, in_features]
-        output: [batch_size, out_features]
-        """
-        # Apply the fixed sparse mask to the trainable weights
         effective_weight = self.weight * self.mask
         return F.linear(input, effective_weight, self.bias)
 
@@ -149,84 +129,84 @@ class IndexSNN(nn.Module):
         self.lif3 = snn.Leaky(beta=beta, spike_grad=spike_grad)
         self.lif_out = snn.Leaky(beta=beta, spike_grad=spike_grad)
 
-        def forward(
-            self,
-            x_seq,
-            return_hidden_spikes: bool = False,
-            return_time_series: bool = False,
-        ):
-            # x_seq: [T, B, input_dim]
-            T_steps, B, _ = x_seq.shape
-            device = x_seq.device
+    def forward(
+        self,
+        x_seq,
+        return_hidden_spikes: bool = False,
+        return_time_series: bool = False,
+    ):
+        # x_seq: [T, B, input_dim]
+        T_steps, B, _ = x_seq.shape
+        device = x_seq.device
 
-            # Membrane potentials
-            mem1 = torch.zeros(B, self.fc1.out_features, device=device)
-            mem2 = torch.zeros(B, self.fc2.out_features, device=device)
-            mem3 = torch.zeros(B, self.fc3.out_features, device=device)
-            mem_out = torch.zeros(B, self.fc_out.out_features, device=device)
+        # Membrane potentials
+        mem1 = torch.zeros(B, self.fc1.out_features, device=device)
+        mem2 = torch.zeros(B, self.fc2.out_features, device=device)
+        mem3 = torch.zeros(B, self.fc3.out_features, device=device)
+        mem_out = torch.zeros(B, self.fc_out.out_features, device=device)
 
-            # Output spike counts
-            spk_out_sum = torch.zeros(B, self.fc_out.out_features, device=device)
+        # Output spike counts
+        spk_out_sum = torch.zeros(B, self.fc_out.out_features, device=device)
 
-            # Optional: sums of hidden spikes over time
+        # Optional: sums of hidden spikes over time
+        if return_hidden_spikes:
+            spk1_sum = torch.zeros(B, self.fc1.out_features, device=device)
+            spk2_sum = torch.zeros(B, self.fc2.out_features, device=device)
+            spk3_sum = torch.zeros(B, self.fc3.out_features, device=device)
+
+        # Optional: full time series of hidden spikes [T, B, H]
+        if return_time_series:
+            spk1_ts = torch.zeros(T_steps, B, self.fc1.out_features, device=device)
+            spk2_ts = torch.zeros(T_steps, B, self.fc2.out_features, device=device)
+            spk3_ts = torch.zeros(T_steps, B, self.fc3.out_features, device=device)
+
+        for t in range(T_steps):
+            x_t = x_seq[t]  # [B, input_dim]
+
+            # Layer 1
+            cur1 = self.fc1(x_t)
+            spk1, mem1 = self.lif1(cur1, mem1)
+
+            # Layer 2
+            cur2 = self.fc2(spk1)
+            spk2, mem2 = self.lif2(cur2, mem2)
+
+            # Layer 3
+            cur3 = self.fc3(spk2)
+            spk3, mem3 = self.lif3(cur3, mem3)
+
+            # Output
+            cur_out = self.fc_out(spk3)
+            spk_out, mem_out = self.lif_out(cur_out, mem_out)
+
+            spk_out_sum += spk_out
+
             if return_hidden_spikes:
-                spk1_sum = torch.zeros(B, self.fc1.out_features, device=device)
-                spk2_sum = torch.zeros(B, self.fc2.out_features, device=device)
-                spk3_sum = torch.zeros(B, self.fc3.out_features, device=device)
+                spk1_sum += spk1
+                spk2_sum += spk2
+                spk3_sum += spk3
 
-            # Optional: full time series of hidden spikes [T, B, H]
             if return_time_series:
-                spk1_ts = torch.zeros(T_steps, B, self.fc1.out_features, device=device)
-                spk2_ts = torch.zeros(T_steps, B, self.fc2.out_features, device=device)
-                spk3_ts = torch.zeros(T_steps, B, self.fc3.out_features, device=device)
+                spk1_ts[t] = spk1
+                spk2_ts[t] = spk2
+                spk3_ts[t] = spk3
 
-            for t in range(T_steps):
-                x_t = x_seq[t]  # [B, input_dim]
+        # 1) time-series mode
+        if return_time_series:
+            hidden_time = {
+                "layer1": spk1_ts,  # [T, B, H]
+                "layer2": spk2_ts,
+                "layer3": spk3_ts,
+            }
+            return spk_out_sum, hidden_time
 
-                # Layer 1
-                cur1 = self.fc1(x_t)
-                spk1, mem1 = self.lif1(cur1, mem1)
+        # 2) summed-hidden mode
+        if return_hidden_spikes:
+            hidden_spikes = {
+                "layer1": spk1_sum,  # [B, H]
+                "layer2": spk2_sum,
+                "layer3": spk3_sum,
+            }
+            return spk_out_sum, hidden_spikes
 
-                # Layer 2
-                cur2 = self.fc2(spk1)
-                spk2, mem2 = self.lif2(cur2, mem2)
-
-                # Layer 3
-                cur3 = self.fc3(spk2)
-                spk3, mem3 = self.lif3(cur3, mem3)
-
-                # Output
-                cur_out = self.fc_out(spk3)
-                spk_out, mem_out = self.lif_out(cur_out, mem_out)
-
-                spk_out_sum += spk_out
-
-                if return_hidden_spikes:
-                    spk1_sum += spk1
-                    spk2_sum += spk2
-                    spk3_sum += spk3
-
-                if return_time_series:
-                    spk1_ts[t] = spk1
-                    spk2_ts[t] = spk2
-                    spk3_ts[t] = spk3
-
-            # 1) time-series mode
-            if return_time_series:
-                hidden_time = {
-                    "layer1": spk1_ts,  # [T, B, H]
-                    "layer2": spk2_ts,
-                    "layer3": spk3_ts,
-                }
-                return spk_out_sum, hidden_time
-
-            # 2) summed-hidden mode 
-            if return_hidden_spikes:
-                hidden_spikes = {
-                    "layer1": spk1_sum,  # [B, H]
-                    "layer2": spk2_sum,
-                    "layer3": spk3_sum,
-                }
-                return spk_out_sum, hidden_spikes
-
-            return spk_out_sum
+        return spk_out_sum
