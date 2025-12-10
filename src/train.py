@@ -92,7 +92,7 @@ def compute_ch_matrix(pre_batch, post_batch):
 def _grow_connections(mask_cpu, ch_cpu, num_to_grow, mode):
     inactive = ~mask_cpu.bool()
     inactive_idx = inactive.nonzero(as_tuple=False)
-    if inactive_idx.size(0) == 0:
+    if inactive_idx.size(0) == 0 or num_to_grow <= 0:
         return mask_cpu, 0
 
     num_to_grow = min(num_to_grow, inactive_idx.size(0))
@@ -141,28 +141,37 @@ def dst_update_layer_cp_cg_single(layer, layer_name, prune_frac, cp_mode_local, 
     # pruning
     if cp_mode_local == "set":
         active_weights = w_cpu[active].abs().view(-1)
-        thresh, _ = torch.kthvalue(active_weights, min(total_to_prune, active_weights.numel()))
+        n_eff = min(total_to_prune, active_weights.numel())
+        if n_eff < 1:
+            return
+        thresh, _ = torch.kthvalue(active_weights, n_eff)
         prune_mask = active & (w_cpu.abs() <= thresh)
     elif cp_mode_local == "random":
         active_idx = active.nonzero(as_tuple=False)
-        perm = torch.randperm(active_idx.size(0))[:total_to_prune]
+        n_eff = min(total_to_prune, active_idx.size(0))
+        if n_eff < 1:
+            return
+        perm = torch.randperm(active_idx.size(0))[:n_eff]
         chosen = active_idx[perm]
         prune_mask = torch.zeros_like(mask_cpu, dtype=torch.bool)
         prune_mask[chosen[:, 0], chosen[:, 1]] = True
     else:  # hebb
-        active_scores = ch_cpu[active]
-        thresh, _ = torch.kthvalue(active_scores, total_to_prune)
+        if ch_cpu is None:
+            return
+        active_scores = ch_cpu[active].view(-1)
+        n_eff = min(total_to_prune, active_scores.numel())
+        if n_eff < 1:
+            return
+        thresh, _ = torch.kthvalue(active_scores, n_eff)
         prune_mask = active & (ch_cpu <= thresh)
 
     mask_cpu[prune_mask] = 0
     num_pruned = prune_mask.sum().item()
 
-    # growth
     if ch_cpu is None:
         ch_cpu = torch.zeros_like(mask_cpu, dtype=torch.float32)
 
     mask_cpu, _ = _grow_connections(mask_cpu, ch_cpu, num_pruned, cg_mode_local)
-
     mask.copy_(mask_cpu.to(device))
     weight[~mask.bool()] = 0.0
 
@@ -184,16 +193,18 @@ def train_one_epoch(model, loader, optimizer, device, epoch_idx, use_dst):
     correct = 0
 
     for batch_idx, (images, labels) in enumerate(loader):
-
-        # PROGRESS BAR
+        # progress bar
         progress = (batch_idx + 1) / total_batches
         bar_len = 30
         filled = int(bar_len * progress)
         bar = "█" * filled + "░" * (bar_len - filled)
         percent = int(progress * 100)
         end_char = "\r" if (batch_idx + 1) < total_batches else "\n"
-        print(f"[Epoch {epoch_idx}] [{bar}] {percent:3d}% ({batch_idx + 1}/{total_batches})",
-              end=end_char, flush=True)
+        print(
+            f"[Epoch {epoch_idx}] [{bar}] {percent:3d}% ({batch_idx + 1}/{total_batches})",
+            end=end_char,
+            flush=True,
+        )
 
         labels = labels.to(device, non_blocking=True)
         spikes = rate_encode(images, T).to(device)
@@ -247,11 +258,11 @@ def compute_firing_rates(model, loader, device):
         B = images.size(0)
         total_samples += B
         spikes = rate_encode(images, T).to(device)
-        _, h = model(spikes, return_hidden_spikes=True)
+        _, hidden_spikes = model(spikes, return_hidden_spikes=True)
 
-        b1 = h["layer1"].sum(dim=0)
-        b2 = h["layer2"].sum(dim=0)
-        b3 = h["layer3"].sum(dim=0)
+        b1 = hidden_spikes["layer1"].sum(dim=0)
+        b2 = hidden_spikes["layer2"].sum(dim=0)
+        b3 = hidden_spikes["layer3"].sum(dim=0)
 
         if l1_sum is None:
             l1_sum, l2_sum, l3_sum = b1, b2, b3
@@ -272,6 +283,74 @@ def compute_firing_rates(model, loader, device):
         "layer3_mean": r3.mean().item(),
         "overall_hidden_mean": allr.mean().item(),
     }
+
+
+@torch.no_grad()
+def compute_group_synchrony(model, loader, device, num_groups: int):
+    """
+    Μετράει πόσο 'μαζεμένα' στο χρόνο είναι τα spikes ανά group (IndexSNN)
+    χρησιμοποιώντας temporal variance.
+
+    Μικρότερη variance => πιο συγχρονισμένα spikes.
+    """
+    if not isinstance(model, IndexSNN):
+        raise TypeError("compute_group_synchrony is implemented only for IndexSNN")
+
+    model.eval()
+
+    stats = {
+        "layer1_var_sum": 0.0,
+        "layer2_var_sum": 0.0,
+        "layer3_var_sum": 0.0,
+        "layer1_groups": 0,
+        "layer2_groups": 0,
+        "layer3_groups": 0,
+    }
+
+    for images, _ in loader:
+        B = images.size(0)
+        spikes = rate_encode(images, T).to(device)  # [T, B, 784]
+
+        # εδώ θέλουμε πλήρες time-series από το IndexSNN
+        _, hidden_time = model(spikes, return_time_series=True)
+        # hidden_time["layerX"]: [T, B, H]
+
+        for layer_name in ["layer1", "layer2", "layer3"]:
+            spk_time = hidden_time[layer_name]  # [T, B, H]
+            T_steps, _, H = spk_time.shape
+            group_size = H // num_groups
+
+            t_idx = torch.arange(T_steps, device=spk_time.device, dtype=torch.float32)
+
+            for g in range(num_groups):
+                start = g * group_size
+                end = (g + 1) * group_size
+
+                group_spikes = spk_time[:, :, start:end]  # [T, B, group_size]
+                s_t = group_spikes.sum(dim=(1, 2))       # [T]
+
+                if s_t.sum().item() == 0:
+                    continue
+
+                w = s_t / s_t.sum()
+                mu = (w * t_idx).sum()
+                var_g = (((t_idx - mu) ** 2) * w).sum().item()
+
+                key_v = f"{layer_name}_var_sum"
+                key_c = f"{layer_name}_groups"
+                stats[key_v] += var_g
+                stats[key_c] += 1
+
+    sync = {}
+    for layer_name in ["layer1", "layer2", "layer3"]:
+        key_v = f"{layer_name}_var_sum"
+        key_c = f"{layer_name}_groups"
+        if stats[key_c] > 0:
+            sync[f"{layer_name}_mean_temporal_var"] = stats[key_v] / stats[key_c]
+        else:
+            sync[f"{layer_name}_mean_temporal_var"] = float("nan")
+
+    return sync
 
 
 def parse_args():
@@ -320,12 +399,23 @@ def main():
         test_acc = evaluate(model, test_loader, device)
         print(f"Epoch {epoch:02d} | train_acc={train_acc:.4f} | test_acc={test_acc:.4f}")
 
+    # firing rates
     rates = compute_firing_rates(model, test_loader, device)
     print("Average firing rates:")
     print(f"  L1: {rates['layer1_mean']:.6f}")
     print(f"  L2: {rates['layer2_mean']:.6f}")
     print(f"  L3: {rates['layer3_mean']:.6f}")
     print(f"  Overall: {rates['overall_hidden_mean']:.6f}")
+
+    # synchrony metric μόνο για IndexSNN
+    if isinstance(model, IndexSNN):
+        ng = model.fc1.num_groups
+        sync = compute_group_synchrony(model, test_loader, device, ng)
+        print("Group-wise temporal synchrony (mean variance per group):")
+        print(f"  Layer 1 mean temporal var: {sync['layer1_mean_temporal_var']:.6f}")
+        print(f"  Layer 2 mean temporal var: {sync['layer2_mean_temporal_var']:.6f}")
+        print(f"  Layer 3 mean temporal var: {sync['layer3_mean_temporal_var']:.6f}")
+        print("  (Lower variance => more synchronized spikes within groups)")
 
 
 if __name__ == "__main__":
