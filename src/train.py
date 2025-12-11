@@ -435,9 +435,9 @@ def compute_cross_group_coherence(model, loader, device):
                     denom = torch.sqrt(var.unsqueeze(0) * var.unsqueeze(1) + 1e-8)
                     corr_mat = cov / denom
                     
-                    mask = torch.triu(torch.ones_like(corr_mat, dtype=torch.bool), diagonal=1)
-                    if mask.sum() > 0:
-                        coherence = corr_mat[mask].mean().item()
+                    triu_mask = torch.triu(torch.ones_like(corr_mat, dtype=torch.bool), diagonal=1)
+                    if triu_mask.sum() > 0:
+                        coherence = corr_mat[triu_mask].mean().item()
                         coherences.append(coherence)
                         cross_group_ratios.append(cross_ratio)
                         
