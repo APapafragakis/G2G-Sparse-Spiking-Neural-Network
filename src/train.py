@@ -357,18 +357,18 @@ def compute_group_synchrony(model, loader, device, num_groups: int):
 @torch.no_grad()
 def compute_cross_group_coherence(model, loader, device):
     """
-    Measures temporal coherence of inputs from different groups.
+    Measures temporal coherence of inputs from different groups using pairwise correlation.
     
     Key idea: When a neuron receives inputs from multiple groups processing different features,
-    those groups spike asynchronously (at different times). This asynchrony makes it harder
-    for the neuron to integrate inputs effectively due to membrane leakage.
+    those groups spike asynchronously. This metric measures how temporally aligned the spike
+    patterns from different groups are.
     
-    Coherence metric: For each neuron, at each timestep, count how many of its input groups
-    spike together. High coherence = many groups spike simultaneously. Low coherence = groups
-    spike at different times.
+    Coherence metric: For each neuron, compute pairwise temporal correlations between the
+    spike activity of its connected groups. High coherence = groups spike in synchrony.
+    Low coherence = groups spike at different, uncorrelated times.
     
     Expected results:
-    - Low p_inter: neurons connect mainly to same group -> high coherence
+    - Low p_inter: neurons connect mainly to same group -> N/A or high coherence
     - High p_inter: neurons connect to many groups -> low coherence -> lower firing rates
     """
     if not isinstance(model, IndexSNN):
@@ -427,16 +427,22 @@ def compute_cross_group_coherence(model, loader, device):
                     group_spikes = source_spikes[:, :, group_neurons].sum(dim=(1, 2))
                     group_activity[:, g_idx] = (group_spikes > 0).float()
                 
-                groups_active_per_t = group_activity.sum(dim=1)
-                active_steps = (groups_active_per_t > 0).sum().item()
-                
-                if active_steps > 0:
-                    coherence = groups_active_per_t.sum().item() / (active_steps * len(unique_groups))
-                    coherences.append(coherence)
-                    cross_group_ratios.append(cross_ratio)
+                if len(unique_groups) >= 2:
+                    ga = group_activity - group_activity.mean(dim=0, keepdim=True)
                     
-                    fr = hidden_time[layer_name][:, :, neuron_idx].sum().item() / (T_steps * B)
-                    firing_rates.append(fr)
+                    cov = (ga.T @ ga) / T_steps
+                    var = torch.diag(cov)
+                    denom = torch.sqrt(var.unsqueeze(0) * var.unsqueeze(1) + 1e-8)
+                    corr_mat = cov / denom
+                    
+                    mask = torch.triu(torch.ones_like(corr_mat, dtype=torch.bool), diagonal=1)
+                    if mask.sum() > 0:
+                        coherence = corr_mat[mask].mean().item()
+                        coherences.append(coherence)
+                        cross_group_ratios.append(cross_ratio)
+                        
+                        fr = hidden_time[layer_name][:, :, neuron_idx].sum().item() / (T_steps * B)
+                        firing_rates.append(fr)
             
             if len(coherences) > 10:
                 import numpy as np
