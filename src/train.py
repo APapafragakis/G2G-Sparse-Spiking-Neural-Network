@@ -465,6 +465,102 @@ def compute_cross_group_coherence(model, loader, device):
     return results
 
 
+@torch.no_grad()
+def compute_within_group_correlation(model, loader, device):
+    """
+    Μετράει πόσο συγχρονισμένα spike-άρουν neurons ΜΕΣΑ στο ίδιο group.
+    """
+    if not isinstance(model, IndexSNN):
+        raise TypeError("Requires IndexSNN")
+    
+    import numpy as np
+    model.eval()
+    
+    for images, _ in loader:
+        B = images.size(0)
+        spikes_input = rate_encode(images, T).to(device)
+        _, hidden_time = model(spikes_input, return_time_series=True)
+        
+        results = {}
+        num_groups = model.fc1.num_groups
+        
+        for layer_name, fc_layer in [
+            ("layer1", model.fc1),
+            ("layer2", model.fc2),
+            ("layer3", model.fc3)
+        ]:
+            spk_ts = hidden_time[layer_name]
+            T_steps, _, H = spk_ts.shape
+            group_size = H // num_groups
+            
+            group_correlations = []
+            group_entropies = []
+            
+            for g in range(num_groups):
+                start_idx = g * group_size
+                end_idx = (g + 1) * group_size
+                
+                group_spikes = spk_ts[:, :, start_idx:end_idx]
+                group_flat = group_spikes.reshape(T_steps * B, group_size)
+                
+                if group_flat.sum() < 10:
+                    continue
+                
+                sample_size = min(30, group_size)
+                sampled_idx = torch.randperm(group_size, device=device)[:sample_size]
+                group_sample = group_flat[:, sampled_idx]
+                
+                corrs = []
+                for i in range(sample_size):
+                    for j in range(i+1, sample_size):
+                        n1 = group_sample[:, i].float()
+                        n2 = group_sample[:, j].float()
+                        
+                        if n1.std() > 1e-8 and n2.std() > 1e-8:
+                            n1_c = n1 - n1.mean()
+                            n2_c = n2 - n2.mean()
+                            corr = (n1_c * n2_c).mean() / (n1.std() * n2.std() + 1e-8)
+                            corrs.append(corr.item())
+                
+                if len(corrs) > 0:
+                    group_correlations.append(np.mean(corrs))
+                
+                if layer_name == "layer1":
+                    input_group_counts = torch.zeros(num_groups, device=device)
+                    input_group_size = fc_layer.in_features // num_groups
+                    
+                    for local_idx in range(group_size):
+                        global_idx = start_idx + local_idx
+                        conn_mask = fc_layer.mask[global_idx].bool()
+                        connected_idx = torch.where(conn_mask)[0]
+                        connected_groups = connected_idx // input_group_size
+                        
+                        for ig in range(num_groups):
+                            input_group_counts[ig] += (connected_groups == ig).sum()
+                    
+                    probs = input_group_counts / (input_group_counts.sum() + 1e-8)
+                    probs = probs[probs > 0]
+                    if len(probs) > 0:
+                        entropy = -(probs * torch.log2(probs + 1e-8)).sum().item()
+                        group_entropies.append(entropy)
+            
+            if len(group_correlations) > 0:
+                results[layer_name] = {
+                    "mean_correlation": np.mean(group_correlations),
+                    "std_correlation": np.std(group_correlations),
+                    "min_correlation": np.min(group_correlations),
+                    "max_correlation": np.max(group_correlations),
+                }
+                
+                if len(group_entropies) > 0 and layer_name == "layer1":
+                    results[layer_name]["mean_input_entropy"] = np.mean(group_entropies)
+                    results[layer_name]["std_input_entropy"] = np.std(group_entropies)
+        
+        break
+    
+    return results
+
+
 def parse_args():
     p = argparse.ArgumentParser(description="Train SNN on Fashion-MNIST.")
     p.add_argument("--model", type=str, default="dense",
