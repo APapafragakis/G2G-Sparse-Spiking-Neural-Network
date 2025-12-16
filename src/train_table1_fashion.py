@@ -1,7 +1,7 @@
 # src/train_table1_fmnist.py
 #
 # Table-style comparison on Fashion-MNIST.
-# Paper-faithful patch encoder (16 patches) + several SNN head variants.
+# Patch encoder (16 patches) + several SNN head variants.
 
 import os
 import sys
@@ -55,7 +55,7 @@ def select_device() -> torch.device:
 
 
 # ---------------------------------------------------------------------
-# Hyperparameters for the experiment
+# Hyperparameters 
 # ---------------------------------------------------------------------
 batch_size = 256
 T = 70                  # timesteps for sequence input
@@ -85,7 +85,7 @@ class CNNSNNWrapper(nn.Module):
     def __init__(self, head: nn.Module, T_steps: int = T):
         super().__init__()
         # 28x28 split into 4x4=16 patches of size 7x7, conv per patch -> [B, 32, 4, 4] -> flatten [B, 512]
-        self.encoder = PaperPatchEncoder(in_channels=1, img_size=28, out_channels=32, grid_size=4)
+        self.encoder = PatchEncoder(in_channels=1, img_size=28, out_channels=32, grid_size=4)
         self.head = head
         self.T = T_steps
 

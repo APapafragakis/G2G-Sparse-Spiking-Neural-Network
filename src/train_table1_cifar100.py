@@ -1,7 +1,7 @@
 # src/train_table1_cifar100.py
 #
 # Table-I-style comparison on CIFAR-100
-# Paper-faithful patch encoder (16 patches) + SNN heads (FC v1, FC v2, ER, G2G).
+# Patch encoder (16 patches) + SNN heads (FC v1, FC v2, ER, G2G).
 
 import os
 import sys
@@ -76,7 +76,7 @@ class CNNSNNWrapper(nn.Module):
         super().__init__()
 
         # 32x32 split into 4x4=16 patches of size 8x8, conv per patch -> [B, 32, 4, 4] -> flatten [B, 512]
-        self.encoder = PaperPatchEncoder(in_channels=3, img_size=32, out_channels=32, grid_size=4)
+        self.encoder = PatchEncoder(in_channels=3, img_size=32, out_channels=32, grid_size=4)
         self.head = head
         self.T = T_steps
 
