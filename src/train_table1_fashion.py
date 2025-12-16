@@ -295,9 +295,8 @@ def main():
     # -----------------------------------------------------------------
     # Aggregate and display a compact table-like summary
     # -----------------------------------------------------------------
-    print("\n" + "#" * 80)
+    print("\n")
     print("Summary on Fashion-MNIST (CNN encoder + SNN heads)")
-    print("#" * 80)
 
     # Index results by id for easier access
     id_to_res = {r["id"]: r for r in results}
