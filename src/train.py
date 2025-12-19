@@ -1,7 +1,6 @@
 import os
 import sys
 import argparse
-from datetime import datetime
 
 ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if ROOT_DIR not in sys.path:
@@ -20,17 +19,6 @@ import warnings
 
 warnings.filterwarnings("ignore", message=".*aten::lerp.Scalar_out.*")
 
-# Global log file handle
-log_file = None
-
-def log_print(*args, **kwargs):
-    """Print to both console and log file"""
-    # Print to console
-    print(*args, **kwargs)
-    # Write to log file if it exists
-    if log_file is not None:
-        print(*args, **kwargs, file=log_file, flush=True)
-
 try:
     import torch_directml
     has_dml = True
@@ -41,13 +29,13 @@ except ImportError:
 def select_device():
     if has_dml:
         device = torch_directml.device()
-        log_print(f"Using DirectML device: {device}")
+        print(f"Using DirectML device: {device}")
         return device
     if torch.cuda.is_available():
         device = torch.device("cuda")
-        log_print(f"Using GPU: {torch.cuda.get_device_name(0)} | CUDA {torch.version.cuda}")
+        print(f"Using GPU: {torch.cuda.get_device_name(0)} | CUDA {torch.version.cuda}")
         return device
-    log_print("No GPU backend available — using CPU.")
+    print("No GPU backend available — using CPU.")
     return torch.device("cpu")
 
 
@@ -74,6 +62,9 @@ cg_mode = "hebb"
 
 # Buffers for Hebbian pre/post activity
 hebb_buffer = {"fc1": None, "fc2": None, "fc3": None}
+
+# Check if output is redirected (for .bat script compatibility)
+IS_TTY = sys.stdout.isatty()
 
 
 def build_model(model_name: str, p_inter: float):
@@ -186,7 +177,7 @@ def dst_step(model, prune_frac=0.025):
             short = name.split(".")[-1]
             if short in hebb_buffer:
                 dst_update_layer_cp_cg_single(module, short, prune_frac, cp_mode, cg_mode)
-    log_print("[DST] step executed")
+    print("[DST] step executed")
 
 
 def _make_input_sequence(images, device):
@@ -205,19 +196,21 @@ def train_one_epoch(model, loader, optimizer, device, epoch_idx, use_dst):
     total = 0
     correct = 0
     total_batches = len(loader)
+    
     for batch_idx, (images, labels) in enumerate(loader):
-        # Progress bar - ONLY to console (not to log file)
-        progress = (batch_idx + 1) / total_batches
-        bar_len = 30
-        filled = int(bar_len * progress)
-        bar = "█" * filled + "░" * (bar_len - filled)
-        percent = int(progress * 100)
-        end_char = "\r" if (batch_idx + 1) < total_batches else "\n"
-        print(
-            f"[Epoch {epoch_idx}] [{bar}] {percent:3d}% ({batch_idx + 1}/{total_batches})",
-            end=end_char,
-            flush=True,
-        )
+        # Progress bar - only show if output is to terminal
+        if IS_TTY:
+            progress = (batch_idx + 1) / total_batches
+            bar_len = 30
+            filled = int(bar_len * progress)
+            bar = "█" * filled + "░" * (bar_len - filled)
+            percent = int(progress * 100)
+            end_char = "\r" if (batch_idx + 1) < total_batches else "\n"
+            print(
+                f"[Epoch {epoch_idx}] [{bar}] {percent:3d}% ({batch_idx + 1}/{total_batches})",
+                end=end_char,
+                flush=True,
+            )
 
         labels = labels.to(device, non_blocking=True)
         x_seq = _make_input_sequence(images, device)
@@ -493,36 +486,24 @@ def parse_args():
     p.add_argument("--enc", type=str, default="current", choices=["current", "rate"])
     p.add_argument("--enc_scale", type=float, default=1.0)
     p.add_argument("--enc_bias", type=float, default=0.0)
-    p.add_argument("--log_dir", type=str, default="logs", help="Directory to save log files")
     return p.parse_args()
 
 
 def main():
-    global log_file
     args = parse_args()
-    
-    # Create log directory if it doesn't exist
-    os.makedirs(args.log_dir, exist_ok=True)
-    
-    # Create log file with timestamp and configuration
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    log_filename = f"{args.dataset}_{args.model}_{args.sparsity_mode}_T{args.T}_{timestamp}.log"
-    log_path = os.path.join(args.log_dir, log_filename)
-    log_file = open(log_path, 'w')
-    
-    log_print(f"Log file: {log_path}")
-    log_print("=" * 70)
-    
     device = select_device()
+    
     global cp_mode, cg_mode, T, batch_size
     cp_mode = args.cp
     cg_mode = args.cg
     T = args.T
     batch_size = args.batch_size
+    
     global enc_mode, enc_scale, enc_bias
     enc_mode = args.enc
     enc_scale = float(args.enc_scale)
     enc_bias = float(args.enc_bias)
+    
     global input_dim, num_classes
     if args.dataset == "fashionmnist":
         input_dim = 28 * 28
@@ -536,14 +517,15 @@ def main():
         input_dim = 3 * 32 * 32
         num_classes = 100
         train_loader, test_loader = get_cifar100_loaders(batch_size)
+    
     num_groups = 8 if args.model in ["index", "random", "mixer"] else "N/A"
-    log_print(
+    print(
         f"[CONFIG] dataset={args.dataset} | model={args.model} | "
         f"sparsity={args.sparsity_mode} | T={T} | epochs={args.epochs} | "
         f"batch={batch_size} | groups={num_groups} | p_inter={args.p_inter} | "
         f"enc={enc_mode} | enc_scale={enc_scale} | enc_bias={enc_bias}"
     )
-    log_print("=" * 70)
+    print("=" * 70)
     
     model = build_model(args.model, args.p_inter).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-4)
@@ -552,62 +534,58 @@ def main():
     for epoch in range(1, args.epochs + 1):
         train_acc = train_one_epoch(model, train_loader, optimizer, device, epoch, use_dst)
         test_acc = evaluate(model, test_loader, device)
-        log_print(f"Epoch {epoch:02d} | train_acc={train_acc:.4f} | test_acc={test_acc:.4f}")
+        print(f"Epoch {epoch:02d} | train_acc={train_acc:.4f} | test_acc={test_acc:.4f}")
     
-    log_print("\n" + "=" * 70)
-    log_print("FINAL METRICS")
-    log_print("=" * 70)
+    print("\n" + "=" * 70)
+    print("FINAL METRICS")
+    print("=" * 70)
     
     rates = compute_firing_rates(model, test_loader, device)
-    log_print("\nAverage firing rates:")
-    log_print(f" L1: {rates['layer1_mean']:.6f}")
-    log_print(f" L2: {rates['layer2_mean']:.6f}")
-    log_print(f" L3: {rates['layer3_mean']:.6f}")
-    log_print(f" Overall: {rates['overall_hidden_mean']:.6f}")
+    print("\nAverage firing rates:")
+    print(f" L1: {rates['layer1_mean']:.6f}")
+    print(f" L2: {rates['layer2_mean']:.6f}")
+    print(f" L3: {rates['layer3_mean']:.6f}")
+    print(f" Overall: {rates['overall_hidden_mean']:.6f}")
     
     if isinstance(model, IndexSNN):
         ng = model.fc1.num_groups
         sync = compute_group_synchrony(model, test_loader, device, ng)
-        log_print("\nGroup-wise temporal synchrony (mean variance per group):")
-        log_print(f" Layer 1 mean temporal var: {sync['layer1_mean_temporal_var']:.6f}")
-        log_print(f" Layer 2 mean temporal var: {sync['layer2_mean_temporal_var']:.6f}")
-        log_print(f" Layer 3 mean temporal var: {sync['layer3_mean_temporal_var']:.6f}")
+        print("\nGroup-wise temporal synchrony (mean variance per group):")
+        print(f" Layer 1 mean temporal var: {sync['layer1_mean_temporal_var']:.6f}")
+        print(f" Layer 2 mean temporal var: {sync['layer2_mean_temporal_var']:.6f}")
+        print(f" Layer 3 mean temporal var: {sync['layer3_mean_temporal_var']:.6f}")
         
         corr_data = compute_cross_group_coherence(model, test_loader, device)
         if corr_data:
-            log_print("\nCross-group temporal coherence analysis:")
+            print("\nCross-group temporal coherence analysis:")
             for layer_name in ["layer2", "layer3"]:
                 if layer_name in corr_data:
                     d = corr_data[layer_name]
-                    log_print(f"\n {layer_name.capitalize()}:")
-                    log_print(f"  Avg cross-group ratio: {d['avg_cross_group_ratio']:.4f}")
-                    log_print(f"  Avg temporal coherence: {d['avg_coherence']:.4f}")
-                    log_print(f"  Avg firing rate: {d['avg_firing_rate']:.6f}")
-                    log_print(f"  Correlation (cross-group % vs coherence): r={d['corr_crossgroup_coherence']:.3f}")
-                    log_print(f"  Correlation (coherence vs firing): r={d['corr_coherence_firingrate']:.3f}")
+                    print(f"\n {layer_name.capitalize()}:")
+                    print(f"  Avg cross-group ratio: {d['avg_cross_group_ratio']:.4f}")
+                    print(f"  Avg temporal coherence: {d['avg_coherence']:.4f}")
+                    print(f"  Avg firing rate: {d['avg_firing_rate']:.6f}")
+                    print(f"  Correlation (cross-group % vs coherence): r={d['corr_crossgroup_coherence']:.3f}")
+                    print(f"  Correlation (coherence vs firing): r={d['corr_coherence_firingrate']:.3f}")
         
         import numpy as np
-        log_print("\n" + "=" * 70)
-        log_print("Within-Group Spike Correlation Analysis")
-        log_print("=" * 70)
+        print("\n" + "=" * 70)
+        print("Within-Group Spike Correlation Analysis")
+        print("=" * 70)
         wg_results = compute_within_group_correlation(model, test_loader, device)
         for layer_name in ["layer1", "layer2", "layer3"]:
             if layer_name in wg_results:
                 d = wg_results[layer_name]
-                log_print(f"\n{layer_name.upper()}:")
-                log_print(f" Mean within-group correlation: {d['mean_correlation']:.4f} ± {d['std_correlation']:.4f}")
-                log_print(f" Range: [{d['min_correlation']:.4f}, {d['max_correlation']:.4f}]")
+                print(f"\n{layer_name.upper()}:")
+                print(f" Mean within-group correlation: {d['mean_correlation']:.4f} ± {d['std_correlation']:.4f}")
+                print(f" Range: [{d['min_correlation']:.4f}, {d['max_correlation']:.4f}]")
                 if "mean_input_entropy" in d:
-                    log_print(f" Input feature diversity (entropy): {d['mean_input_entropy']:.4f} ± {d['std_input_entropy']:.4f}")
-                    log_print(f" (max entropy = {np.log2(model.fc1.num_groups):.2f} bits)")
+                    print(f" Input feature diversity (entropy): {d['mean_input_entropy']:.4f} ± {d['std_input_entropy']:.4f}")
+                    print(f" (max entropy = {np.log2(model.fc1.num_groups):.2f} bits)")
     
-    log_print("\n" + "=" * 70)
-    log_print(f"Training completed. Results saved to: {log_path}")
-    log_print("=" * 70)
-    
-    # Close log file
-    if log_file is not None:
-        log_file.close()
+    print("\n" + "=" * 70)
+    print("Training completed.")
+    print("=" * 70)
 
 
 if __name__ == "__main__":
