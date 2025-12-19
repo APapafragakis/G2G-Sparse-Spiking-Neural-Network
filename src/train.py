@@ -1,7 +1,6 @@
 import os
 import sys
 import argparse
-import json
 
 ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if ROOT_DIR not in sys.path:
@@ -73,7 +72,19 @@ def get_checkpoint_path(args):
     checkpoint_dir = "checkpoints"
     os.makedirs(checkpoint_dir, exist_ok=True)
     
-    filename = f"{args.dataset}_{args.model}_p{args.p_inter}_T{args.T}_{args.enc}.pth"
+    # Format p_inter to avoid messy decimals
+    p_str = f"{args.p_inter:.2f}".replace(".", "_")
+    filename = f"{args.dataset}_{args.model}_p{p_str}_T{args.T}_{args.enc}.pth"
+    return os.path.join(checkpoint_dir, filename)
+
+
+def get_done_marker_path(args):
+    """Generate DONE marker filename to track completed runs"""
+    checkpoint_dir = "checkpoints"
+    os.makedirs(checkpoint_dir, exist_ok=True)
+    
+    p_str = f"{args.p_inter:.2f}".replace(".", "_")
+    filename = f"{args.dataset}_{args.model}_p{p_str}_T{args.T}_{args.enc}.DONE"
     return os.path.join(checkpoint_dir, filename)
 
 
@@ -101,7 +112,7 @@ def load_checkpoint(model, optimizer, args):
     checkpoint_path = get_checkpoint_path(args)
     
     if not os.path.exists(checkpoint_path):
-        return 0  # Start from epoch 0
+        return 1  # Start from epoch 1 (not 0!)
     
     try:
         checkpoint = torch.load(checkpoint_path, map_location='cpu')
@@ -117,7 +128,7 @@ def load_checkpoint(model, optimizer, args):
         return start_epoch
     except Exception as e:
         print(f"[Warning: Failed to load checkpoint: {e}]")
-        return 0
+        return 1
 
 
 def build_model(model_name: str, p_inter: float):
@@ -539,12 +550,19 @@ def parse_args():
     p.add_argument("--enc", type=str, default="current", choices=["current", "rate"])
     p.add_argument("--enc_scale", type=float, default=1.0)
     p.add_argument("--enc_bias", type=float, default=0.0)
-    p.add_argument("--no_checkpoint", action="store_true", help="Disable checkpoint saving/loading")
     return p.parse_args()
 
 
 def main():
     args = parse_args()
+    
+    # Check if already completed
+    done_marker = get_done_marker_path(args)
+    if os.path.exists(done_marker):
+        print("[DONE] This experiment already finished. Skipping.")
+        print(f"[INFO] To re-run, delete: {done_marker}")
+        return
+    
     device = select_device()
     
     global cp_mode, cg_mode, T, batch_size
@@ -585,43 +603,41 @@ def main():
     optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-4)
     use_dst = (args.sparsity_mode == "dynamic")
     
-    # Load checkpoint if exists (unless disabled)
-    start_epoch = 1
-    if not args.no_checkpoint:
-        start_epoch = load_checkpoint(model, optimizer, args)
-        if start_epoch > 1:
-            model = model.to(device)  # Ensure model is on correct device after loading
+    # Load checkpoint if exists
+    start_epoch = load_checkpoint(model, optimizer, args)
+    if start_epoch > 1:
+        model = model.to(device)  # Ensure model is on correct device after loading
     
-    # If already completed, skip training
-    if start_epoch > args.epochs:
-        print(f"[Training already completed - skipping to metrics computation]")
-    else:
-        try:
-            for epoch in range(start_epoch, args.epochs + 1):
-                train_acc = train_one_epoch(model, train_loader, optimizer, device, epoch, use_dst)
-                test_acc = evaluate(model, test_loader, device)
-                print(f"Epoch {epoch:02d} | train_acc={train_acc:.4f} | test_acc={test_acc:.4f}")
-                
-                # Save checkpoint after each epoch (unless disabled)
-                if not args.no_checkpoint:
-                    save_checkpoint(epoch, model, optimizer, args, {
-                        'train_acc': train_acc,
-                        'test_acc': test_acc
-                    })
-        except KeyboardInterrupt:
-            print("\n[Training interrupted - checkpoint saved]")
-            if not args.no_checkpoint:
-                # Save current progress before exiting
-                epoch_completed = epoch - 1 if epoch > start_epoch else start_epoch
-                save_checkpoint(epoch_completed, model, optimizer, args)
-            return
+    # Track last completed epoch for safe interrupt handling
+    last_completed_epoch = start_epoch - 1
     
-    # Clean up checkpoint after successful completion
-    if not args.no_checkpoint:
-        checkpoint_path = get_checkpoint_path(args)
-        if os.path.exists(checkpoint_path):
-            os.remove(checkpoint_path)
-            print("[Checkpoint removed - training completed successfully]")
+    try:
+        for epoch in range(start_epoch, args.epochs + 1):
+            train_acc = train_one_epoch(model, train_loader, optimizer, device, epoch, use_dst)
+            test_acc = evaluate(model, test_loader, device)
+            print(f"Epoch {epoch:02d} | train_acc={train_acc:.4f} | test_acc={test_acc:.4f}")
+            
+            # Update last completed epoch
+            last_completed_epoch = epoch
+            
+            # Save checkpoint after each successful epoch
+            save_checkpoint(epoch, model, optimizer, args, {
+                'train_acc': train_acc,
+                'test_acc': test_acc
+            })
+            
+    except KeyboardInterrupt:
+        print("\n[Training interrupted by user - checkpoint saved]")
+        # Save the last successfully completed epoch
+        if last_completed_epoch >= start_epoch:
+            save_checkpoint(last_completed_epoch, model, optimizer, args)
+        return
+    except Exception as e:
+        print(f"\n[ERROR] Training failed: {e}")
+        # Save the last successfully completed epoch
+        if last_completed_epoch >= start_epoch:
+            save_checkpoint(last_completed_epoch, model, optimizer, args)
+        raise
     
     print("\n" + "=" * 70)
     print("FINAL METRICS")
@@ -671,8 +687,13 @@ def main():
                     print(f" (max entropy = {np.log2(model.fc1.num_groups):.2f} bits)")
     
     print("\n" + "=" * 70)
-    print("Training completed.")
+    print("Training completed successfully!")
     print("=" * 70)
+    
+    # Mark as done (checkpoint remains for reproducibility)
+    with open(done_marker, 'w') as f:
+        f.write("Training completed successfully\n")
+    print(f"[DONE marker created: {done_marker}]")
 
 
 if __name__ == "__main__":
