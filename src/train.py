@@ -16,7 +16,7 @@ from models.mixer_snn import MixerSNN, MixerSparseLinear
 
 from data.fashionmnist import get_fashion_loaders
 from data.cifar10_100 import get_cifar10_loaders, get_cifar100_loaders
-from utils.encoding import rate_encode
+from utils.encoding import encode_input
 
 import warnings
 warnings.filterwarnings("ignore", message=".*aten::lerp.Scalar_out.*")
