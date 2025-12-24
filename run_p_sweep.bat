@@ -29,6 +29,6 @@ echo Running Dense baseline with 20 epochs...
 python evaluation/train.py --model dense --epochs 20 > "%OUTDIR%/dense.txt"
 
 echo.
-echo Done! All logs saved in %OUTDIR%
 
 endlocal
+
